@@ -590,42 +590,38 @@ impl<B: Serialize + Clone> JsonBlockCacheDB<B> {
 
         trace!(target: "cache", "saving json cache");
 
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Err(e) = self.write_cache_atomically(path) {
+            return warn!(target: "cache", %e, "Failed to publish json cache");
         }
 
-        let file = match fs::File::create(path) {
-            Ok(file) => file,
-            Err(e) => return warn!(target: "cache", %e, "Failed to open json cache for writing"),
-        };
+        trace!(target: "cache", "saved json cache");
+    }
+
+    /// Publish a complete cache without truncating the previous generation on failure.
+    fn write_cache_atomically(&self, path: &Path) -> eyre::Result<()> {
+        let parent =
+            path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
 
         #[cfg(feature = "zstd")]
         {
-            // Default zstd compression level (3) offers a good balance of speed and ratio.
-            let mut encoder = match Encoder::new(file, 3) {
-                Ok(enc) => enc,
-                Err(e) => return warn!(target: "cache", %e, "Failed to create zstd encoder"),
-            };
-            if let Err(e) = serde_json::to_writer(&mut encoder, &self.data) {
-                return warn!(target: "cache", %e, "Failed to write to zstd json cache");
-            }
-            if let Err(e) = encoder.finish() {
-                return warn!(target: "cache", %e, "Failed to finish zstd compression");
-            }
+            // Finish the frame before publishing, so interrupted writes keep the old cache.
+            let mut encoder = Encoder::new(file.as_file_mut(), 3)?;
+            serde_json::to_writer(&mut encoder, &self.data)?;
+            encoder.finish()?;
         }
 
         #[cfg(not(feature = "zstd"))]
         {
-            let mut writer = BufWriter::new(file);
-            if let Err(e) = serde_json::to_writer(&mut writer, &self.data) {
-                return warn!(target: "cache", %e, "Failed to write to json cache");
-            }
-            if let Err(e) = writer.flush() {
-                return warn!(target: "cache", %e, "Failed to flush to json cache");
-            }
+            let mut writer = BufWriter::new(file.as_file_mut());
+            serde_json::to_writer(&mut writer, &self.data)?;
+            writer.flush()?;
         }
 
-        trace!(target: "cache", "saved json cache");
+        file.as_file().sync_all()?;
+        file.persist(path)?;
+        Ok(())
     }
 }
 
@@ -751,7 +747,7 @@ mod tests {
         for existing_cache in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("cache.json");
-            let previous = if existing_cache {
+            let previous = existing_cache.then(|| {
                 let db = JsonBlockCacheDB::new(
                     Arc::new(RwLock::new(BlockchainDbMeta::new(
                         BlockEnv::default(),
@@ -760,10 +756,8 @@ mod tests {
                     Some(path.clone()),
                 );
                 db.flush();
-                Some(fs::read(&path).unwrap())
-            } else {
-                None
-            };
+                fs::read(&path).unwrap()
+            });
             let failing = JsonBlockCacheDB::new(
                 Arc::new(RwLock::new(BlockchainDbMeta::new(
                     InterruptedSerialization,
