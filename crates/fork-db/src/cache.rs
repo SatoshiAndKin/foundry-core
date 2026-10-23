@@ -682,6 +682,8 @@ impl<B: Serialize + Clone> Drop for FlushJsonBlockCacheDB<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{Bytes, keccak256};
+    use revm::state::Bytecode;
 
     #[test]
     fn can_deserialize_cache() {
@@ -924,6 +926,56 @@ mod tests {
         assert!(![0x28, 0xB5].starts_with(&ZSTD_FRAME_MAGIC));
         // empty
         assert!(![].starts_with(&ZSTD_FRAME_MAGIC));
+    }
+
+    #[test]
+    fn cache_load_shares_equal_code_without_sharing_account_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared-code.json");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), Some(path.clone()));
+        let first = Address::from_word(keccak256("first shared-code account"));
+        let second = Address::from_word(keccak256("second shared-code account"));
+        let distinct = Address::from_word(keccak256("different-code account"));
+        for (address, balance, nonce, immediate) in
+            [(first, 11u64, 7u64, 1u8), (second, 17, 13, 1), (distinct, 23, 19, 2)]
+        {
+            // Start with independent allocations, as separate RPC reads do.
+            let code = Bytecode::new_raw(Bytes::from(vec![0x60, immediate, 0x00]));
+            db.accounts().write().insert(
+                address,
+                AccountInfo {
+                    balance: U256::from(balance),
+                    nonce,
+                    code_hash: code.hash_slow(),
+                    code: Some(code),
+                    ..Default::default()
+                },
+            );
+        }
+        db.cache().flush();
+
+        let loaded = JsonBlockCacheDB::<BlockEnv>::load(path).unwrap();
+        let accounts = loaded.db().accounts.read();
+        for (address, balance, nonce, immediate) in
+            [(first, 11u64, 7u64, 1u8), (second, 17, 13, 1), (distinct, 23, 19, 2)]
+        {
+            let account = &accounts[&address];
+            assert_eq!(account.balance, U256::from(balance));
+            assert_eq!(account.nonce, nonce);
+            assert_eq!(
+                account.code.as_ref().unwrap().original_byte_slice(),
+                &[0x60, immediate, 0x00]
+            );
+            assert_eq!(account.code_hash, keccak256([0x60, immediate, 0x00]));
+        }
+        let first_code = accounts[&first].code.as_ref().unwrap().original_byte_slice();
+        let second_code = accounts[&second].code.as_ref().unwrap().original_byte_slice();
+        let distinct_code = accounts[&distinct].code.as_ref().unwrap().original_byte_slice();
+        assert!(!std::ptr::eq(first_code.as_ptr(), distinct_code.as_ptr()));
+        assert!(
+            std::ptr::eq(first_code.as_ptr(), second_code.as_ptr()),
+            "equal cached bytecode must reuse its backing allocation"
+        );
     }
 
     #[test]
