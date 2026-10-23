@@ -6,17 +6,23 @@ use parking_lot::RwLock;
 use revm::{
     DatabaseCommit,
     context::BlockEnv,
-    primitives::{KECCAK_EMPTY, StorageKeyMap, map::AddressHashMap},
-    state::{Account, AccountInfo, AccountStatus},
+    primitives::{
+        KECCAK_EMPTY, StorageKeyMap,
+        map::{AddressHashMap, HashMap},
+    },
+    state::{Account, AccountInfo, AccountStatus, Bytecode},
 };
 use serde::{
-    Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned, ser::SerializeMap,
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{DeserializeOwned, MapAccess, Visitor},
+    ser::SerializeMap,
 };
 #[cfg(not(feature = "zstd"))]
 use std::io::{BufWriter, Write};
 use std::{
     collections::BTreeSet,
-    fs,
+    fmt, fs,
+    io::{BufReader, Cursor, Read},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -25,7 +31,7 @@ use std::{
 };
 use url::Url;
 #[cfg(feature = "zstd")]
-use zstd::{Encoder, decode_all};
+use zstd::{Encoder, stream::read::Decoder};
 
 pub type StorageInfo = StorageKeyMap<U256>;
 
@@ -345,6 +351,24 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for Blockc
     }
 }
 
+/// Share immutable code across accounts without sharing their balances or nonces.
+#[derive(Debug, Default)]
+pub(crate) struct BytecodeInterner {
+    codes: HashMap<B256, Bytecode>,
+}
+
+impl BytecodeInterner {
+    pub(crate) fn intern(&mut self, code: Bytecode) -> Bytecode {
+        self.codes.entry(code.hash_slow()).or_insert(code).clone()
+    }
+
+    pub(crate) fn share_account_code(&mut self, account: &mut AccountInfo) {
+        if let Some(code) = account.code.take() {
+            account.code = Some(self.intern(code));
+        }
+    }
+}
+
 /// In Memory cache containing all fetched accounts and storage slots
 /// and their values from RPC
 #[derive(Debug, Default)]
@@ -505,15 +529,10 @@ impl<B: ForkBlockEnv> JsonBlockCacheDB<B> {
     pub fn load(path: impl Into<PathBuf>) -> eyre::Result<Self> {
         let path = path.into();
         trace!(target: "cache", ?path, "reading json cache");
-        let raw = fs::read(&path).inspect_err(|err| {
+        let file = fs::File::open(&path).inspect_err(|err| {
             warn!(?err, ?path, "Failed to read cache file");
         })?;
-
-        let json_bytes = maybe_decompress(&raw, &path).inspect_err(|err| {
-            warn!(target: "cache", ?err, ?path, "Failed to decode cache file");
-        })?;
-
-        let data = serde_json::from_slice(&json_bytes).inspect_err(|err| {
+        let data = read_cache_data(file, &path).inspect_err(|err| {
             warn!(target: "cache", ?err, ?path, "Failed to deserialize cache data");
         })?;
         trace!(target: "cache", ?path, "read json cache");
@@ -526,22 +545,23 @@ impl<B: ForkBlockEnv> JsonBlockCacheDB<B> {
     }
 }
 
-/// Decompresses the raw bytes if they are zstd-compressed, otherwise returns them as-is.
-///
-/// When the `zstd` feature is **not** enabled and zstd-compressed data is detected, this
-/// returns an error with a helpful message.
-fn maybe_decompress(raw: &[u8], path: &Path) -> eyre::Result<Vec<u8>> {
-    if !raw.starts_with(&ZSTD_FRAME_MAGIC) {
-        return Ok(raw.to_vec());
+/// Detect compression from a bounded prefix, then deserialize without retaining the input.
+fn read_cache_data<B: ForkBlockEnv>(
+    mut reader: impl Read,
+    path: &Path,
+) -> eyre::Result<JsonBlockCacheData<B>> {
+    let mut prefix = Vec::with_capacity(ZSTD_FRAME_MAGIC.len());
+    reader.by_ref().take(ZSTD_FRAME_MAGIC.len() as u64).read_to_end(&mut prefix)?;
+    let compressed = prefix.starts_with(&ZSTD_FRAME_MAGIC);
+    let reader = Cursor::new(prefix).chain(reader);
+    if !compressed {
+        return Ok(serde_json::from_reader(BufReader::new(reader))?);
     }
 
     #[cfg(feature = "zstd")]
     {
         trace!(target: "cache", ?path, "decompressing zstd cache");
-        let decompressed = decode_all(raw).inspect_err(|err| {
-            warn!(target: "cache", ?err, ?path, "Failed to decompress zstd cache");
-        })?;
-        Ok(decompressed)
+        Ok(serde_json::from_reader(BufReader::new(Decoder::new(reader)?))?)
     }
 
     #[cfg(not(feature = "zstd"))]
@@ -640,6 +660,7 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBl
         #[derive(Deserialize)]
         struct Data<B> {
             meta: B,
+            #[serde(deserialize_with = "deserialize_accounts")]
             accounts: AddressHashMap<AccountInfo>,
             storage: AddressHashMap<StorageInfo>,
             block_hashes: U256Map<B256>,
@@ -664,6 +685,36 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBl
     }
 }
 
+fn deserialize_accounts<'de, D>(deserializer: D) -> Result<AddressHashMap<AccountInfo>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AccountsVisitor;
+
+    impl<'de> Visitor<'de> for AccountsVisitor {
+        type Value = AddressHashMap<AccountInfo>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of fork accounts")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut accounts = AddressHashMap::default();
+            let mut bytecodes = BytecodeInterner::default();
+            while let Some((address, mut account)) = map.next_entry::<Address, AccountInfo>()? {
+                bytecodes.share_account_code(&mut account);
+                accounts.insert(address, account);
+            }
+            Ok(accounts)
+        }
+    }
+
+    deserializer.deserialize_map(AccountsVisitor)
+}
+
 /// A type that flushes a `JsonBlockCacheDB` on drop
 ///
 /// This type intentionally does not implement `Clone` since it's intended that there's only once
@@ -683,7 +734,6 @@ impl<B: Serialize + Clone> Drop for FlushJsonBlockCacheDB<B> {
 mod tests {
     use super::*;
     use alloy_primitives::{Bytes, keccak256};
-    use revm::state::Bytecode;
 
     #[test]
     fn can_deserialize_cache() {

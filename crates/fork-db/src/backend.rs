@@ -2,13 +2,14 @@
 
 use crate::{
     cache::{
-        AccountFetchPolicy, BlockchainDb, FlushJsonBlockCacheDB, ForkBlockEnv, MemDb, StorageInfo,
+        AccountFetchPolicy, BlockchainDb, BytecodeInterner, FlushJsonBlockCacheDB, ForkBlockEnv,
+        MemDb, StorageInfo,
     },
     error::{DatabaseError, DatabaseResult},
 };
 use alloy_chains::Chain;
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Address, B256, Bytes, U64, U256, keccak256, map::U256Map};
+use alloy_primitives::{Address, B256, Bytes, U64, U256, map::U256Map};
 use alloy_provider::{
     DynProvider, Network, Provider,
     network::{AnyNetwork, BlockResponse, primitives::HeaderResponse},
@@ -204,6 +205,8 @@ pub struct BackendHandler<N: Network = AnyNetwork, B = BlockEnv> {
     provider: DynProvider<N>,
     /// Stores all the data.
     db: BlockchainDb<B>,
+    /// Immutable code shared by cached and newly fetched accounts.
+    bytecodes: BytecodeInterner,
     /// Requests currently in progress
     pending_requests: Vec<ProviderRequest<eyre::Report, N>>,
     /// Listeners that wait for a `get_account` related response
@@ -251,9 +254,14 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
             }
         });
         let account_fetch_policy = db.meta().read().account_fetch_policy;
+        let mut bytecodes = BytecodeInterner::default();
+        for account in db.accounts().write().values_mut() {
+            bytecodes.share_account_code(account);
+        }
         Self {
             provider,
             db,
+            bytecodes,
             account_fetch_policy,
             pending_requests: Default::default(),
             account_requests: Default::default(),
@@ -329,7 +337,8 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
                 self.block_generation = self.block_generation.wrapping_add(1);
             }
             BackendRequest::UpdateAddress(address_data) => {
-                for (address, data) in address_data {
+                for (address, mut data) in address_data {
+                    self.bytecodes.share_account_code(&mut data);
                     self.db.accounts().write().insert(address, data);
                 }
             }
@@ -768,17 +777,14 @@ impl<N: Network, B: ForkBlockEnv> Future for BackendHandler<N, B> {
                             };
 
                             // convert it to revm-style types
-                            let (code, code_hash) = if code.is_empty() {
-                                (Bytes::default(), KECCAK_EMPTY)
-                            } else {
-                                (code.clone(), keccak256(&code))
-                            };
+                            let code = pin.bytecodes.intern(Bytecode::new_raw(code));
+                            let code_hash = code.hash_slow();
 
                             // update the cache
                             let acc = AccountInfo {
                                 nonce,
                                 balance,
-                                code: Some(Bytecode::new_raw(code)),
+                                code: Some(code),
                                 code_hash,
                                 account_id: None,
                             };
@@ -1326,6 +1332,7 @@ impl<N: Network, B: ForkBlockEnv> DatabaseRef for SharedBackend<N, B> {
 mod tests {
     use super::*;
     use crate::cache::{BlockchainDbMeta, JsonBlockCacheDB};
+    use alloy_primitives::keccak256;
     use alloy_provider::ProviderBuilder;
     use alloy_rpc_client::ClientBuilder;
     use serde::Deserialize;
