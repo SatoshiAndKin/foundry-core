@@ -1,22 +1,29 @@
 //! Cache related abstraction
 
 use alloy_chains::Chain;
-use alloy_primitives::{Address, B256, U256, map::U256Map};
+use alloy_primitives::{Address, B256, U256};
+use imbl::HashMap as PersistentMap;
 use parking_lot::RwLock;
 use revm::{
     DatabaseCommit,
     context::BlockEnv,
-    primitives::{KECCAK_EMPTY, StorageKeyMap, map::AddressHashMap},
-    state::{Account, AccountInfo, AccountStatus},
+    primitives::{
+        KECCAK_EMPTY,
+        map::{AddressHashMap, HashMap},
+    },
+    state::{Account, AccountInfo, AccountStatus, Bytecode},
 };
 use serde::{
-    Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned, ser::SerializeMap,
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{DeserializeOwned, MapAccess, Visitor},
+    ser::SerializeMap,
 };
 #[cfg(not(feature = "zstd"))]
 use std::io::{BufWriter, Write};
 use std::{
     collections::BTreeSet,
-    fs,
+    fmt, fs,
+    io::{BufReader, Cursor, Read},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -25,9 +32,9 @@ use std::{
 };
 use url::Url;
 #[cfg(feature = "zstd")]
-use zstd::{Encoder, decode_all};
+use zstd::{Encoder, stream::read::Decoder};
 
-pub type StorageInfo = StorageKeyMap<U256>;
+pub type StorageInfo = PersistentMap<U256, U256>;
 
 /// Zstd frame magic number: `0x28B52FFD` (little-endian).
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -118,17 +125,17 @@ impl<B: ForkBlockEnv> BlockchainDb<B> {
     }
 
     /// Returns the map that holds the account related info
-    pub fn accounts(&self) -> &RwLock<AddressHashMap<AccountInfo>> {
+    pub fn accounts(&self) -> &RwLock<PersistentMap<Address, AccountInfo>> {
         &self.db.accounts
     }
 
     /// Returns the map that holds the storage related info
-    pub fn storage(&self) -> &RwLock<AddressHashMap<StorageInfo>> {
+    pub fn storage(&self) -> &RwLock<PersistentMap<Address, StorageInfo>> {
         &self.db.storage
     }
 
     /// Returns the map that holds all the block hashes
-    pub fn block_hashes(&self) -> &RwLock<U256Map<B256>> {
+    pub fn block_hashes(&self) -> &RwLock<PersistentMap<U256, B256>> {
         &self.db.block_hashes
     }
 
@@ -345,16 +352,37 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for Blockc
     }
 }
 
+/// Share immutable code across accounts without sharing their balances or nonces.
+#[derive(Debug, Default)]
+pub(crate) struct BytecodeInterner {
+    codes: HashMap<B256, Bytecode>,
+}
+
+impl BytecodeInterner {
+    pub(crate) fn intern(&mut self, code: Bytecode) -> Bytecode {
+        self.codes.entry(code.hash_slow()).or_insert(code).clone()
+    }
+
+    pub(crate) fn share_account_code(&mut self, account: &mut AccountInfo) {
+        if let Some(code) = account.code.take() {
+            account.code = Some(self.intern(code));
+        }
+    }
+}
+
 /// In Memory cache containing all fetched accounts and storage slots
-/// and their values from RPC
+/// and their values from RPC.
+///
+/// Persistent maps share unchanged entries with historical snapshots. Mutations preserve
+/// the values retained by earlier snapshots.
 #[derive(Debug, Default)]
 pub struct MemDb {
     /// Account related data
-    pub accounts: RwLock<AddressHashMap<AccountInfo>>,
+    pub accounts: RwLock<PersistentMap<Address, AccountInfo>>,
     /// Storage related data
-    pub storage: RwLock<AddressHashMap<StorageInfo>>,
+    pub storage: RwLock<PersistentMap<Address, StorageInfo>>,
     /// All retrieved block hashes
-    pub block_hashes: RwLock<U256Map<B256>>,
+    pub block_hashes: RwLock<PersistentMap<U256, B256>>,
 }
 
 impl MemDb {
@@ -505,15 +533,10 @@ impl<B: ForkBlockEnv> JsonBlockCacheDB<B> {
     pub fn load(path: impl Into<PathBuf>) -> eyre::Result<Self> {
         let path = path.into();
         trace!(target: "cache", ?path, "reading json cache");
-        let raw = fs::read(&path).inspect_err(|err| {
+        let file = fs::File::open(&path).inspect_err(|err| {
             warn!(?err, ?path, "Failed to read cache file");
         })?;
-
-        let json_bytes = maybe_decompress(&raw, &path).inspect_err(|err| {
-            warn!(target: "cache", ?err, ?path, "Failed to decode cache file");
-        })?;
-
-        let data = serde_json::from_slice(&json_bytes).inspect_err(|err| {
+        let data = read_cache_data(file, &path).inspect_err(|err| {
             warn!(target: "cache", ?err, ?path, "Failed to deserialize cache data");
         })?;
         trace!(target: "cache", ?path, "read json cache");
@@ -526,22 +549,23 @@ impl<B: ForkBlockEnv> JsonBlockCacheDB<B> {
     }
 }
 
-/// Decompresses the raw bytes if they are zstd-compressed, otherwise returns them as-is.
-///
-/// When the `zstd` feature is **not** enabled and zstd-compressed data is detected, this
-/// returns an error with a helpful message.
-fn maybe_decompress(raw: &[u8], path: &Path) -> eyre::Result<Vec<u8>> {
-    if !raw.starts_with(&ZSTD_FRAME_MAGIC) {
-        return Ok(raw.to_vec());
+/// Detect compression from a bounded prefix, then deserialize without retaining the input.
+fn read_cache_data<B: ForkBlockEnv>(
+    mut reader: impl Read,
+    path: &Path,
+) -> eyre::Result<JsonBlockCacheData<B>> {
+    let mut prefix = Vec::with_capacity(ZSTD_FRAME_MAGIC.len());
+    reader.by_ref().take(ZSTD_FRAME_MAGIC.len() as u64).read_to_end(&mut prefix)?;
+    let compressed = prefix.starts_with(&ZSTD_FRAME_MAGIC);
+    let reader = Cursor::new(prefix).chain(reader);
+    if !compressed {
+        return Ok(serde_json::from_reader(BufReader::new(reader))?);
     }
 
     #[cfg(feature = "zstd")]
     {
         trace!(target: "cache", ?path, "decompressing zstd cache");
-        let decompressed = decode_all(raw).inspect_err(|err| {
-            warn!(target: "cache", ?err, ?path, "Failed to decompress zstd cache");
-        })?;
-        Ok(decompressed)
+        Ok(serde_json::from_reader(BufReader::new(Decoder::new(reader)?))?)
     }
 
     #[cfg(not(feature = "zstd"))]
@@ -570,42 +594,38 @@ impl<B: Serialize + Clone> JsonBlockCacheDB<B> {
 
         trace!(target: "cache", "saving json cache");
 
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Err(e) = self.write_cache_atomically(path) {
+            return warn!(target: "cache", %e, "Failed to publish json cache");
         }
 
-        let file = match fs::File::create(path) {
-            Ok(file) => file,
-            Err(e) => return warn!(target: "cache", %e, "Failed to open json cache for writing"),
-        };
+        trace!(target: "cache", "saved json cache");
+    }
+
+    /// Publish a complete cache without truncating the previous generation on failure.
+    fn write_cache_atomically(&self, path: &Path) -> eyre::Result<()> {
+        let parent =
+            path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
 
         #[cfg(feature = "zstd")]
         {
-            // Default zstd compression level (3) offers a good balance of speed and ratio.
-            let mut encoder = match Encoder::new(file, 3) {
-                Ok(enc) => enc,
-                Err(e) => return warn!(target: "cache", %e, "Failed to create zstd encoder"),
-            };
-            if let Err(e) = serde_json::to_writer(&mut encoder, &self.data) {
-                return warn!(target: "cache", %e, "Failed to write to zstd json cache");
-            }
-            if let Err(e) = encoder.finish() {
-                return warn!(target: "cache", %e, "Failed to finish zstd compression");
-            }
+            // Finish the frame before publishing, so interrupted writes keep the old cache.
+            let mut encoder = Encoder::new(file.as_file_mut(), 3)?;
+            serde_json::to_writer(&mut encoder, &self.data)?;
+            encoder.finish()?;
         }
 
         #[cfg(not(feature = "zstd"))]
         {
-            let mut writer = BufWriter::new(file);
-            if let Err(e) = serde_json::to_writer(&mut writer, &self.data) {
-                return warn!(target: "cache", %e, "Failed to write to json cache");
-            }
-            if let Err(e) = writer.flush() {
-                return warn!(target: "cache", %e, "Failed to flush to json cache");
-            }
+            let mut writer = BufWriter::new(file.as_file_mut());
+            serde_json::to_writer(&mut writer, &self.data)?;
+            writer.flush()?;
         }
 
-        trace!(target: "cache", "saved json cache");
+        file.as_file().sync_all()?;
+        file.persist(path)?;
+        Ok(())
     }
 }
 
@@ -640,9 +660,10 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBl
         #[derive(Deserialize)]
         struct Data<B> {
             meta: B,
-            accounts: AddressHashMap<AccountInfo>,
-            storage: AddressHashMap<StorageInfo>,
-            block_hashes: U256Map<B256>,
+            #[serde(deserialize_with = "deserialize_accounts")]
+            accounts: PersistentMap<Address, AccountInfo>,
+            storage: PersistentMap<Address, StorageInfo>,
+            block_hashes: PersistentMap<U256, B256>,
             #[serde(default)]
             block_hash_cache_version: u8,
         }
@@ -664,6 +685,38 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBl
     }
 }
 
+fn deserialize_accounts<'de, D>(
+    deserializer: D,
+) -> Result<PersistentMap<Address, AccountInfo>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AccountsVisitor;
+
+    impl<'de> Visitor<'de> for AccountsVisitor {
+        type Value = PersistentMap<Address, AccountInfo>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of fork accounts")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut accounts = PersistentMap::new();
+            let mut bytecodes = BytecodeInterner::default();
+            while let Some((address, mut account)) = map.next_entry::<Address, AccountInfo>()? {
+                bytecodes.share_account_code(&mut account);
+                accounts.insert(address, account);
+            }
+            Ok(accounts)
+        }
+    }
+
+    deserializer.deserialize_map(AccountsVisitor)
+}
+
 /// A type that flushes a `JsonBlockCacheDB` on drop
 ///
 /// This type intentionally does not implement `Clone` since it's intended that there's only once
@@ -682,6 +735,50 @@ impl<B: Serialize + Clone> Drop for FlushJsonBlockCacheDB<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{Bytes, keccak256};
+
+    #[derive(Clone)]
+    struct InterruptedSerialization;
+
+    impl Serialize for InterruptedSerialization {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry("written_before_failure", &"partial cache")?;
+            Err(serde::ser::Error::custom("injected serialization failure"))
+        }
+    }
+
+    #[test]
+    fn failed_flush_preserves_published_cache() {
+        for existing_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cache.json");
+            let previous = existing_cache.then(|| {
+                let db = JsonBlockCacheDB::new(
+                    Arc::new(RwLock::new(BlockchainDbMeta::new(
+                        BlockEnv::default(),
+                        String::new(),
+                    ))),
+                    Some(path.clone()),
+                );
+                db.flush();
+                fs::read(&path).unwrap()
+            });
+            let failing = JsonBlockCacheDB::new(
+                Arc::new(RwLock::new(BlockchainDbMeta::new(
+                    InterruptedSerialization,
+                    String::new(),
+                ))),
+                Some(path.clone()),
+            );
+            failing.flush();
+            assert_eq!(fs::read(&path).ok(), previous);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), usize::from(existing_cache));
+            if existing_cache {
+                JsonBlockCacheDB::<BlockEnv>::load(path).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn can_deserialize_cache() {
@@ -927,6 +1024,56 @@ mod tests {
     }
 
     #[test]
+    fn cache_load_shares_equal_code_without_sharing_account_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared-code.json");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), Some(path.clone()));
+        let first = Address::from_word(keccak256("first shared-code account"));
+        let second = Address::from_word(keccak256("second shared-code account"));
+        let distinct = Address::from_word(keccak256("different-code account"));
+        for (address, balance, nonce, immediate) in
+            [(first, 11u64, 7u64, 1u8), (second, 17, 13, 1), (distinct, 23, 19, 2)]
+        {
+            // Start with independent allocations, as separate RPC reads do.
+            let code = Bytecode::new_raw(Bytes::from(vec![0x60, immediate, 0x00]));
+            db.accounts().write().insert(
+                address,
+                AccountInfo {
+                    balance: U256::from(balance),
+                    nonce,
+                    code_hash: code.hash_slow(),
+                    code: Some(code),
+                    ..Default::default()
+                },
+            );
+        }
+        db.cache().flush();
+
+        let loaded = JsonBlockCacheDB::<BlockEnv>::load(path).unwrap();
+        let accounts = loaded.db().accounts.read();
+        for (address, balance, nonce, immediate) in
+            [(first, 11u64, 7u64, 1u8), (second, 17, 13, 1), (distinct, 23, 19, 2)]
+        {
+            let account = &accounts[&address];
+            assert_eq!(account.balance, U256::from(balance));
+            assert_eq!(account.nonce, nonce);
+            assert_eq!(
+                account.code.as_ref().unwrap().original_byte_slice(),
+                &[0x60, immediate, 0x00]
+            );
+            assert_eq!(account.code_hash, keccak256([0x60, immediate, 0x00]));
+        }
+        let first_code = accounts[&first].code.as_ref().unwrap().original_byte_slice();
+        let second_code = accounts[&second].code.as_ref().unwrap().original_byte_slice();
+        let distinct_code = accounts[&distinct].code.as_ref().unwrap().original_byte_slice();
+        assert!(!std::ptr::eq(first_code.as_ptr(), distinct_code.as_ptr()));
+        assert!(
+            std::ptr::eq(first_code.as_ptr(), second_code.as_ptr()),
+            "equal cached bytecode must reuse its backing allocation"
+        );
+    }
+
+    #[test]
     fn flush_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.json");
@@ -1021,5 +1168,70 @@ mod tests {
         // Should load fine even with zstd feature enabled
         let loaded = JsonBlockCacheDB::<BlockEnv>::load(&path).unwrap();
         assert_eq!(loaded.db().accounts.read().len(), 0);
+    }
+
+    struct SmallReads {
+        data: Vec<u8>,
+        position: usize,
+    }
+
+    impl std::io::Read for SmallReads {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = output.len().min(3).min(self.data.len() - self.position);
+            output[..count].copy_from_slice(&self.data[self.position..self.position + count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn stream_load_handles_short_plain_reads() {
+        let cache = JsonBlockCacheData::<BlockEnv> {
+            meta: Arc::new(RwLock::new(BlockchainDbMeta::default())),
+            data: Arc::new(MemDb::default()),
+        };
+        let json = serde_json::to_vec(&cache).unwrap();
+        let mut reader = SmallReads { data: json, position: 0 };
+        let loaded: JsonBlockCacheData<BlockEnv> =
+            read_cache_data(&mut reader, Path::new("short-reads.json")).unwrap();
+        assert_eq!(*loaded.meta.read(), *cache.meta.read());
+        assert!(loaded.data.accounts.read().is_empty());
+        assert_eq!(reader.position, reader.data.len());
+    }
+
+    #[test]
+    fn stream_load_rejects_invalid_json_without_buffering_entire_input() {
+        let mut reader = SmallReads { data: vec![b'!'; 1024 * 1024], position: 0 };
+        let result: eyre::Result<JsonBlockCacheData<BlockEnv>> =
+            read_cache_data(&mut reader, Path::new("invalid.json"));
+        assert!(result.is_err());
+        assert!(
+            reader.position < reader.data.len(),
+            "invalid input must fail before full buffering"
+        );
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn stream_load_handles_short_compressed_reads_and_rejects_truncation() {
+        let cache = JsonBlockCacheData::<BlockEnv> {
+            meta: Arc::new(RwLock::new(BlockchainDbMeta::default())),
+            data: Arc::new(MemDb::default()),
+        };
+        let json = serde_json::to_vec(&cache).unwrap();
+        let compressed = zstd::encode_all(json.as_slice(), 3).unwrap();
+        let mut reader = SmallReads { data: compressed.clone(), position: 0 };
+        let loaded: JsonBlockCacheData<BlockEnv> =
+            read_cache_data(&mut reader, Path::new("short-reads.json.zst")).unwrap();
+        assert_eq!(*loaded.meta.read(), *cache.meta.read());
+        assert!(loaded.data.accounts.read().is_empty());
+        assert_eq!(reader.position, reader.data.len());
+
+        for length in [compressed.len() / 2, compressed.len() - 1] {
+            let mut reader = SmallReads { data: compressed[..length].to_vec(), position: 0 };
+            let result: eyre::Result<JsonBlockCacheData<BlockEnv>> =
+                read_cache_data(&mut reader, Path::new("truncated.json.zst"));
+            assert!(result.is_err(), "a truncated compressed frame must fail at length {length}");
+        }
     }
 }

@@ -2,13 +2,14 @@
 
 use crate::{
     cache::{
-        AccountFetchPolicy, BlockchainDb, FlushJsonBlockCacheDB, ForkBlockEnv, MemDb, StorageInfo,
+        AccountFetchPolicy, BlockchainDb, BytecodeInterner, FlushJsonBlockCacheDB, ForkBlockEnv,
+        MemDb, StorageInfo,
     },
     error::{DatabaseError, DatabaseResult},
 };
 use alloy_chains::Chain;
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Address, B256, Bytes, U64, U256, keccak256, map::U256Map};
+use alloy_primitives::{Address, B256, Bytes, U64, U256};
 use alloy_provider::{
     DynProvider, Network, Provider,
     network::{AnyNetwork, BlockResponse, primitives::HeaderResponse},
@@ -22,12 +23,13 @@ use futures::{
     stream::Stream,
     task::{Context, Poll},
 };
+use imbl::HashMap as PersistentMap;
 use revm::{
     context::BlockEnv,
     database::DatabaseRef,
     primitives::{
         KECCAK_EMPTY,
-        map::{AddressHashMap, HashMap, hash_map::Entry},
+        map::{HashMap, hash_map::Entry},
     },
     state::{AccountInfo, Bytecode},
 };
@@ -108,9 +110,9 @@ type FullBlockSender<N = AnyNetwork> = OneshotSender<DatabaseResult<<N as Networ
 type TransactionSender<N = AnyNetwork> =
     OneshotSender<DatabaseResult<<N as Network>::TransactionResponse>>;
 
-type AddressData = AddressHashMap<AccountInfo>;
-type StorageData = AddressHashMap<StorageInfo>;
-type BlockHashData = U256Map<B256>;
+type AddressData = PersistentMap<Address, AccountInfo>;
+type StorageData = PersistentMap<Address, StorageInfo>;
+type BlockHashData = PersistentMap<U256, B256>;
 
 /// States for tracking which account endpoints should be used when account info
 const ACCOUNT_FETCH_UNCHECKED: u8 = 0;
@@ -204,6 +206,8 @@ pub struct BackendHandler<N: Network = AnyNetwork, B = BlockEnv> {
     provider: DynProvider<N>,
     /// Stores all the data.
     db: BlockchainDb<B>,
+    /// Immutable code shared by cached and newly fetched accounts.
+    bytecodes: BytecodeInterner,
     /// Requests currently in progress
     pending_requests: Vec<ProviderRequest<eyre::Report, N>>,
     /// Listeners that wait for a `get_account` related response, and whether all are prefetches.
@@ -256,9 +260,14 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
             }
         });
         let account_fetch_policy = db.meta().read().account_fetch_policy;
+        let mut bytecodes = BytecodeInterner::default();
+        for (_, account) in db.accounts().write().iter_mut() {
+            bytecodes.share_account_code(account);
+        }
         Self {
             provider,
             db,
+            bytecodes,
             account_fetch_policy,
             pending_requests: Default::default(),
             account_requests: Default::default(),
@@ -358,7 +367,8 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
                 self.block_generation = self.block_generation.wrapping_add(1);
             }
             BackendRequest::UpdateAddress(address_data) => {
-                for (address, data) in address_data {
+                for (address, mut data) in address_data {
+                    self.bytecodes.share_account_code(&mut data);
                     self.db.accounts().write().insert(address, data);
                 }
             }
@@ -812,17 +822,14 @@ impl<N: Network, B: ForkBlockEnv> Future for BackendHandler<N, B> {
                             };
 
                             // convert it to revm-style types
-                            let (code, code_hash) = if code.is_empty() {
-                                (Bytes::default(), KECCAK_EMPTY)
-                            } else {
-                                (code.clone(), keccak256(&code))
-                            };
+                            let code = pin.bytecodes.intern(Bytecode::new_raw(code));
+                            let code_hash = code.hash_slow();
 
                             // update the cache
                             let acc = AccountInfo {
                                 nonce,
                                 balance,
-                                code: Some(Bytecode::new_raw(code)),
+                                code: Some(code),
                                 code_hash,
                                 account_id: None,
                             };
@@ -1406,10 +1413,11 @@ impl<N: Network, B: ForkBlockEnv> DatabaseRef for SharedBackend<N, B> {
 mod tests {
     use super::*;
     use crate::cache::{BlockchainDbMeta, JsonBlockCacheDB};
+    use alloy_primitives::keccak256;
     use alloy_provider::ProviderBuilder;
     use alloy_rpc_client::ClientBuilder;
     use serde::Deserialize;
-    use std::{fs, path::PathBuf, sync::atomic::AtomicBool, time::Duration};
+    use std::{fs, io::ErrorKind, path::PathBuf, sync::atomic::AtomicBool, time::Duration};
     use tiny_http::{Response, Server};
 
     pub fn get_http_provider(endpoint: &str) -> impl Provider<AnyNetwork> + Clone + use<> {
@@ -2654,6 +2662,115 @@ mod tests {
 
         // erase the temporary file
         fs::remove_file("test-data/storage-tmp.json").unwrap();
+    }
+
+    fn shared_code_account(label: &str, balance: u64, nonce: u64) -> (Address, AccountInfo) {
+        let code = Bytecode::new_raw(Bytes::from(vec![0x60, 0x01, 0x00]));
+        (
+            Address::from_word(keccak256(label)),
+            AccountInfo {
+                balance: U256::from(balance),
+                nonce,
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backend_shares_preloaded_bytecode() {
+        let provider = get_http_provider("http://127.0.0.1:0");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), None);
+        let (first, first_info) = shared_code_account("first preloaded account", 11, 7);
+        let (second, second_info) = shared_code_account("second preloaded account", 17, 13);
+        db.accounts().write().extend([(first, first_info), (second, second_info)]);
+        let backend = SharedBackend::spawn_backend(Arc::new(provider), db, None).await;
+        let first = backend.basic_ref(first).unwrap().unwrap();
+        let second = backend.basic_ref(second).unwrap().unwrap();
+        assert_eq!(first.balance, U256::from(11));
+        assert_eq!(second.nonce, 13);
+        assert!(std::ptr::eq(
+            first.code.unwrap().original_byte_slice().as_ptr(),
+            second.code.unwrap().original_byte_slice().as_ptr(),
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backend_shares_updated_bytecode() {
+        let provider = get_http_provider("http://127.0.0.1:0");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), None);
+        let backend = SharedBackend::spawn_backend(Arc::new(provider), db, None).await;
+        let (first, first_info) = shared_code_account("first updated account", 11, 7);
+        let (second, second_info) = shared_code_account("second updated account", 17, 13);
+        backend.insert_or_update_address(AddressData::from_iter([
+            (first, first_info),
+            (second, second_info),
+        ]));
+        let first = backend.basic_ref(first).unwrap().unwrap();
+        let second = backend.basic_ref(second).unwrap().unwrap();
+        assert_eq!(first.nonce, 7);
+        assert_eq!(second.balance, U256::from(17));
+        assert!(std::ptr::eq(
+            first.code.unwrap().original_byte_slice().as_ptr(),
+            second.code.unwrap().original_byte_slice().as_ptr(),
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backend_shares_bytecode_from_independent_rpc_reads() {
+        let first = Address::from_word(keccak256("first RPC code account"));
+        let second = Address::from_word(keccak256("second RPC code account"));
+        let code = Bytes::from(vec![0x60, 0x01, 0x00]);
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let endpoint = format!("http://{}", server.server_addr());
+        let requests = server.clone();
+        let server_handle = std::thread::spawn(move || {
+            while let Ok(mut request) = requests.recv() {
+                let value: serde_json::Value =
+                    serde_json::from_reader(request.as_reader()).unwrap();
+                let address: Address = serde_json::from_value(value["params"][0].clone()).unwrap();
+                let (balance, nonce) = if address == first { (11u64, 7u64) } else { (17, 13) };
+                let result = match value["method"].as_str().unwrap() {
+                    "eth_getAccountInfo" => serde_json::json!({
+                        "balance": format!("0x{balance:x}"),
+                        "nonce": format!("0x{nonce:x}"),
+                        "code": code,
+                    }),
+                    "eth_getBalance" => serde_json::json!(format!("0x{balance:x}")),
+                    "eth_getTransactionCount" => serde_json::json!(format!("0x{nonce:x}")),
+                    "eth_getCode" => serde_json::json!(code),
+                    method => panic!("unexpected account RPC method: {method}"),
+                };
+                let response =
+                    serde_json::json!({"jsonrpc":"2.0", "id":value["id"], "result":result});
+                if let Err(error) = request.respond(Response::from_string(response.to_string())) {
+                    // Auto mode cancels the losing account-info/triple-request race.
+                    assert!(matches!(
+                        error.kind(),
+                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                    ));
+                }
+            }
+        });
+        let provider = get_http_provider(&endpoint);
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), None);
+        let backend = SharedBackend::spawn_backend(Arc::new(provider), db.clone(), None).await;
+        let first_result = backend.basic_ref(first);
+        let second_result = backend.basic_ref(second);
+        drop(backend);
+        server.unblock();
+        server_handle.join().unwrap();
+        let first_info = first_result.unwrap().unwrap();
+        let second_info = second_result.unwrap().unwrap();
+        assert_eq!(first_info.balance, U256::from(11));
+        assert_eq!(first_info.nonce, 7);
+        assert_eq!(second_info.balance, U256::from(17));
+        assert_eq!(second_info.nonce, 13);
+        assert!(std::ptr::eq(
+            first_info.code.unwrap().original_byte_slice().as_ptr(),
+            second_info.code.unwrap().original_byte_slice().as_ptr(),
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
