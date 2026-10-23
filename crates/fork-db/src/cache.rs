@@ -735,6 +735,51 @@ mod tests {
     use super::*;
     use alloy_primitives::{Bytes, keccak256};
 
+    #[derive(Clone)]
+    struct InterruptedSerialization;
+
+    impl Serialize for InterruptedSerialization {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry("written_before_failure", &"partial cache")?;
+            Err(serde::ser::Error::custom("injected serialization failure"))
+        }
+    }
+
+    #[test]
+    fn failed_flush_preserves_published_cache() {
+        for existing_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cache.json");
+            let previous = if existing_cache {
+                let db = JsonBlockCacheDB::new(
+                    Arc::new(RwLock::new(BlockchainDbMeta::new(
+                        BlockEnv::default(),
+                        String::new(),
+                    ))),
+                    Some(path.clone()),
+                );
+                db.flush();
+                Some(fs::read(&path).unwrap())
+            } else {
+                None
+            };
+            let failing = JsonBlockCacheDB::new(
+                Arc::new(RwLock::new(BlockchainDbMeta::new(
+                    InterruptedSerialization,
+                    String::new(),
+                ))),
+                Some(path.clone()),
+            );
+            failing.flush();
+            assert_eq!(fs::read(&path).ok(), previous);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), usize::from(existing_cache));
+            if existing_cache {
+                JsonBlockCacheDB::<BlockEnv>::load(path).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn can_deserialize_cache() {
         let s = r#"{
