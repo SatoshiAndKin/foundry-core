@@ -1,13 +1,14 @@
 //! Cache related abstraction
 
 use alloy_chains::Chain;
-use alloy_primitives::{Address, B256, U256, map::U256Map};
+use alloy_primitives::{Address, B256, U256};
+use imbl::HashMap as PersistentMap;
 use parking_lot::RwLock;
 use revm::{
     DatabaseCommit,
     context::BlockEnv,
     primitives::{
-        KECCAK_EMPTY, StorageKeyMap,
+        KECCAK_EMPTY,
         map::{AddressHashMap, HashMap},
     },
     state::{Account, AccountInfo, AccountStatus, Bytecode},
@@ -33,7 +34,7 @@ use url::Url;
 #[cfg(feature = "zstd")]
 use zstd::{Encoder, stream::read::Decoder};
 
-pub type StorageInfo = StorageKeyMap<U256>;
+pub type StorageInfo = PersistentMap<U256, U256>;
 
 /// Zstd frame magic number: `0x28B52FFD` (little-endian).
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -124,17 +125,17 @@ impl<B: ForkBlockEnv> BlockchainDb<B> {
     }
 
     /// Returns the map that holds the account related info
-    pub fn accounts(&self) -> &RwLock<AddressHashMap<AccountInfo>> {
+    pub fn accounts(&self) -> &RwLock<PersistentMap<Address, AccountInfo>> {
         &self.db.accounts
     }
 
     /// Returns the map that holds the storage related info
-    pub fn storage(&self) -> &RwLock<AddressHashMap<StorageInfo>> {
+    pub fn storage(&self) -> &RwLock<PersistentMap<Address, StorageInfo>> {
         &self.db.storage
     }
 
     /// Returns the map that holds all the block hashes
-    pub fn block_hashes(&self) -> &RwLock<U256Map<B256>> {
+    pub fn block_hashes(&self) -> &RwLock<PersistentMap<U256, B256>> {
         &self.db.block_hashes
     }
 
@@ -370,15 +371,18 @@ impl BytecodeInterner {
 }
 
 /// In Memory cache containing all fetched accounts and storage slots
-/// and their values from RPC
+/// and their values from RPC.
+///
+/// Persistent maps share unchanged entries with historical snapshots. Mutations preserve
+/// the values retained by earlier snapshots.
 #[derive(Debug, Default)]
 pub struct MemDb {
     /// Account related data
-    pub accounts: RwLock<AddressHashMap<AccountInfo>>,
+    pub accounts: RwLock<PersistentMap<Address, AccountInfo>>,
     /// Storage related data
-    pub storage: RwLock<AddressHashMap<StorageInfo>>,
+    pub storage: RwLock<PersistentMap<Address, StorageInfo>>,
     /// All retrieved block hashes
-    pub block_hashes: RwLock<U256Map<B256>>,
+    pub block_hashes: RwLock<PersistentMap<U256, B256>>,
 }
 
 impl MemDb {
@@ -657,9 +661,9 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBl
         struct Data<B> {
             meta: B,
             #[serde(deserialize_with = "deserialize_accounts")]
-            accounts: AddressHashMap<AccountInfo>,
-            storage: AddressHashMap<StorageInfo>,
-            block_hashes: U256Map<B256>,
+            accounts: PersistentMap<Address, AccountInfo>,
+            storage: PersistentMap<Address, StorageInfo>,
+            block_hashes: PersistentMap<U256, B256>,
             #[serde(default)]
             block_hash_cache_version: u8,
         }
@@ -681,14 +685,16 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBl
     }
 }
 
-fn deserialize_accounts<'de, D>(deserializer: D) -> Result<AddressHashMap<AccountInfo>, D::Error>
+fn deserialize_accounts<'de, D>(
+    deserializer: D,
+) -> Result<PersistentMap<Address, AccountInfo>, D::Error>
 where
     D: Deserializer<'de>,
 {
     struct AccountsVisitor;
 
     impl<'de> Visitor<'de> for AccountsVisitor {
-        type Value = AddressHashMap<AccountInfo>;
+        type Value = PersistentMap<Address, AccountInfo>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("a map of fork accounts")
@@ -698,7 +704,7 @@ where
         where
             A: MapAccess<'de>,
         {
-            let mut accounts = AddressHashMap::default();
+            let mut accounts = PersistentMap::new();
             let mut bytecodes = BytecodeInterner::default();
             while let Some((address, mut account)) = map.next_entry::<Address, AccountInfo>()? {
                 bytecodes.share_account_code(&mut account);

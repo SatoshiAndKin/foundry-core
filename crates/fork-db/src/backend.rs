@@ -9,7 +9,7 @@ use crate::{
 };
 use alloy_chains::Chain;
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Address, B256, Bytes, U64, U256, map::U256Map};
+use alloy_primitives::{Address, B256, Bytes, U64, U256};
 use alloy_provider::{
     DynProvider, Network, Provider,
     network::{AnyNetwork, BlockResponse, primitives::HeaderResponse},
@@ -23,12 +23,13 @@ use futures::{
     stream::Stream,
     task::{Context, Poll},
 };
+use imbl::HashMap as PersistentMap;
 use revm::{
     context::BlockEnv,
     database::DatabaseRef,
     primitives::{
         KECCAK_EMPTY,
-        map::{AddressHashMap, HashMap, hash_map::Entry},
+        map::{HashMap, hash_map::Entry},
     },
     state::{AccountInfo, Bytecode},
 };
@@ -109,9 +110,9 @@ type FullBlockSender<N = AnyNetwork> = OneshotSender<DatabaseResult<<N as Networ
 type TransactionSender<N = AnyNetwork> =
     OneshotSender<DatabaseResult<<N as Network>::TransactionResponse>>;
 
-type AddressData = AddressHashMap<AccountInfo>;
-type StorageData = AddressHashMap<StorageInfo>;
-type BlockHashData = U256Map<B256>;
+type AddressData = PersistentMap<Address, AccountInfo>;
+type StorageData = PersistentMap<Address, StorageInfo>;
+type BlockHashData = PersistentMap<U256, B256>;
 
 /// States for tracking which account endpoints should be used when account info
 const ACCOUNT_FETCH_UNCHECKED: u8 = 0;
@@ -255,7 +256,7 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
         });
         let account_fetch_policy = db.meta().read().account_fetch_policy;
         let mut bytecodes = BytecodeInterner::default();
-        for account in db.accounts().write().values_mut() {
+        for (_, account) in db.accounts().write().iter_mut() {
             bytecodes.share_account_code(account);
         }
         Self {
