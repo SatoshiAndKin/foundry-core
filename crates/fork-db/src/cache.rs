@@ -1074,4 +1074,68 @@ mod tests {
         let loaded = JsonBlockCacheDB::<BlockEnv>::load(&path).unwrap();
         assert_eq!(loaded.db().accounts.read().len(), 0);
     }
+
+    struct SmallReads {
+        data: Vec<u8>,
+        position: usize,
+    }
+
+    impl std::io::Read for SmallReads {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = output.len().min(3).min(self.data.len() - self.position);
+            output[..count].copy_from_slice(&self.data[self.position..self.position + count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn stream_load_handles_short_plain_reads() {
+        let cache = JsonBlockCacheData::<BlockEnv> {
+            meta: Arc::new(RwLock::new(BlockchainDbMeta::default())),
+            data: Arc::new(MemDb::default()),
+        };
+        let json = serde_json::to_vec(&cache).unwrap();
+        let mut reader = SmallReads { data: json, position: 0 };
+        let loaded: JsonBlockCacheData<BlockEnv> =
+            read_cache_data(&mut reader, Path::new("short-reads.json")).unwrap();
+        assert_eq!(*loaded.meta.read(), *cache.meta.read());
+        assert!(loaded.data.accounts.read().is_empty());
+        assert_eq!(reader.position, reader.data.len());
+    }
+
+    #[test]
+    fn stream_load_rejects_invalid_json_without_buffering_entire_input() {
+        let mut reader = SmallReads { data: vec![b'!'; 1024 * 1024], position: 0 };
+        let result: eyre::Result<JsonBlockCacheData<BlockEnv>> =
+            read_cache_data(&mut reader, Path::new("invalid.json"));
+        assert!(result.is_err());
+        assert!(
+            reader.position < reader.data.len(),
+            "invalid input must fail before full buffering"
+        );
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn stream_load_handles_short_compressed_reads_and_rejects_truncation() {
+        let cache = JsonBlockCacheData::<BlockEnv> {
+            meta: Arc::new(RwLock::new(BlockchainDbMeta::default())),
+            data: Arc::new(MemDb::default()),
+        };
+        let json = serde_json::to_vec(&cache).unwrap();
+        let compressed = zstd::encode_all(json.as_slice(), 3).unwrap();
+        let mut reader = SmallReads { data: compressed.clone(), position: 0 };
+        let loaded: JsonBlockCacheData<BlockEnv> =
+            read_cache_data(&mut reader, Path::new("short-reads.json.zst")).unwrap();
+        assert_eq!(*loaded.meta.read(), *cache.meta.read());
+        assert!(loaded.data.accounts.read().is_empty());
+        assert_eq!(reader.position, reader.data.len());
+
+        let mut reader =
+            SmallReads { data: compressed[..compressed.len() / 2].to_vec(), position: 0 };
+        let result: eyre::Result<JsonBlockCacheData<BlockEnv>> =
+            read_cache_data(&mut reader, Path::new("truncated.json.zst"));
+        assert!(result.is_err());
+    }
 }
