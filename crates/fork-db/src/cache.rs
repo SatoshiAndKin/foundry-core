@@ -1132,10 +1132,11 @@ mod tests {
         assert!(loaded.data.accounts.read().is_empty());
         assert_eq!(reader.position, reader.data.len());
 
-        let mut reader =
-            SmallReads { data: compressed[..compressed.len() / 2].to_vec(), position: 0 };
-        let result: eyre::Result<JsonBlockCacheData<BlockEnv>> =
-            read_cache_data(&mut reader, Path::new("truncated.json.zst"));
-        assert!(result.is_err());
+        for length in [compressed.len() / 2, compressed.len() - 1] {
+            let mut reader = SmallReads { data: compressed[..length].to_vec(), position: 0 };
+            let result: eyre::Result<JsonBlockCacheData<BlockEnv>> =
+                read_cache_data(&mut reader, Path::new("truncated.json.zst"));
+            assert!(result.is_err(), "a truncated compressed frame must fail at length {length}");
+        }
     }
 }
