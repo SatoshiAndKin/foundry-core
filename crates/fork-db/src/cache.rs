@@ -18,12 +18,10 @@ use serde::{
     de::{DeserializeOwned, MapAccess, Visitor},
     ser::SerializeMap,
 };
-#[cfg(not(feature = "zstd"))]
-use std::io::{BufWriter, Write};
 use std::{
     collections::BTreeSet,
     fmt, fs,
-    io::{BufReader, Cursor, Read},
+    io::{BufReader, Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -31,6 +29,10 @@ use std::{
     },
 };
 use url::Url;
+
+#[cfg(not(feature = "zstd"))]
+use std::io::BufWriter;
+
 #[cfg(feature = "zstd")]
 use zstd::{Encoder, stream::read::Decoder};
 
@@ -612,14 +614,14 @@ impl<B: Serialize + Clone> JsonBlockCacheDB<B> {
         {
             // Finish the frame before publishing, so interrupted writes keep the old cache.
             let mut encoder = Encoder::new(file.as_file_mut(), 3)?;
-            serde_json::to_writer(&mut encoder, &self.data)?;
+            write_cache_json(&mut encoder, &self.data)?;
             encoder.finish()?;
         }
 
         #[cfg(not(feature = "zstd"))]
         {
             let mut writer = BufWriter::new(file.as_file_mut());
-            serde_json::to_writer(&mut writer, &self.data)?;
+            write_cache_json(&mut writer, &self.data)?;
             writer.flush()?;
         }
 
@@ -627,6 +629,11 @@ impl<B: Serialize + Clone> JsonBlockCacheDB<B> {
         file.persist(path)?;
         Ok(())
     }
+}
+
+fn write_cache_json(writer: impl Write, data: &impl Serialize) -> eyre::Result<()> {
+    serde_json::to_writer(writer, data)?;
+    Ok(())
 }
 
 /// The Data the [JsonBlockCacheDB] can read and flush
@@ -1233,5 +1240,68 @@ mod tests {
                 read_cache_data(&mut reader, Path::new("truncated.json.zst"));
             assert!(result.is_err(), "a truncated compressed frame must fail at length {length}");
         }
+    }
+
+    #[derive(Default)]
+    struct CacheJsonWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for CacheJsonWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !bytes.is_empty() {
+                self.writes += 1;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                Err(std::io::Error::other("injected cache flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cache_json_batches_small_writes_without_changing_bytes() {
+        let data = JsonBlockCacheData {
+            meta: Arc::new(RwLock::new(BlockchainDbMeta::<BlockEnv>::default())),
+            data: Arc::new(MemDb::default()),
+        };
+        for index in 0..128u64 {
+            data.data.accounts.write().insert(
+                Address::from_word(keccak256(index.to_be_bytes())),
+                AccountInfo::from_balance(U256::from(index)),
+            );
+        }
+        let expected = serde_json::to_vec(&data).unwrap();
+        let mut writer = CacheJsonWriter::default();
+        write_cache_json(&mut writer, &data).unwrap();
+        assert_eq!(writer.bytes, expected);
+        assert!(
+            writer.writes <= expected.len().div_ceil(1024),
+            "{} writes for {} bytes must reach the compressor in batches",
+            writer.writes,
+            expected.len()
+        );
+        assert_eq!(writer.flushes, 1);
+    }
+
+    #[test]
+    fn cache_json_propagates_flush_failure() {
+        let data = JsonBlockCacheData {
+            meta: Arc::new(RwLock::new(BlockchainDbMeta::<BlockEnv>::default())),
+            data: Arc::new(MemDb::default()),
+        };
+        let mut writer = CacheJsonWriter { fail_flush: true, ..Default::default() };
+        let error = write_cache_json(&mut writer, &data).unwrap_err();
+        assert_eq!(error.to_string(), "injected cache flush failure");
     }
 }
