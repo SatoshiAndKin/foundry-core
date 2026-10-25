@@ -2645,4 +2645,91 @@ mod tests {
 
         server_handle.join().unwrap();
     }
+
+    #[test]
+    fn cached_state_reads_do_not_require_a_running_handler() {
+        for anchored in [false, true] {
+            let endpoint = "http://127.0.0.1:0";
+            let provider = get_http_provider(endpoint);
+            let hash = keccak256("cached state read anchor");
+            let db = BlockchainDb::new(exact_meta(endpoint, hash), None);
+            let (address, account) = shared_code_account("cached state read account", 11, 7);
+            let slot = U256::from(3);
+            let value = U256::ZERO;
+            db.accounts().write().insert(address, account.clone());
+            db.storage().write().insert(address, StorageInfo::from_iter([(slot, value)]));
+            let (backend, handler) = if anchored {
+                SharedBackend::new_with_anchor(provider, db, ForkBlock::new(42, hash)).unwrap()
+            } else {
+                SharedBackend::new(provider, db, None)
+            };
+            drop(handler);
+
+            assert_eq!(backend.basic_ref(address).unwrap(), Some(account));
+            assert_eq!(backend.storage_ref(address, slot).unwrap(), value);
+            assert_eq!(backend.cache_hits(), 2);
+            assert_eq!(backend.cache_misses(), 0);
+            let missing = Address::from_word(keccak256("uncached state read account"));
+            assert!(backend.basic_ref(missing).is_err());
+            assert!(backend.storage_ref(address, slot + U256::ONE).is_err());
+        }
+    }
+
+    #[test]
+    fn cached_updates_are_visible_before_handler_polling() {
+        let provider = get_http_provider("http://127.0.0.1:0");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), None);
+        let (address, original) = shared_code_account("synchronous cache update account", 11, 7);
+        let (_, replacement) = shared_code_account("synchronous cache update account", 23, 17);
+        let old_slot = U256::from(3);
+        let new_slot = U256::from(5);
+        db.accounts().write().insert(address, original);
+        db.storage().write().insert(address, StorageInfo::from_iter([(old_slot, U256::ONE)]));
+        let (backend, handler) = SharedBackend::new(provider, db.clone(), None);
+        backend.insert_or_update_address(AddressData::from_iter([(address, replacement.clone())]));
+        assert_eq!(db.accounts().read().get(&address), Some(&replacement));
+        backend.insert_or_update_storage(StorageData::from_iter([(
+            address,
+            StorageInfo::from_iter([(new_slot, U256::ZERO)]),
+        )]));
+        assert_eq!(db.storage().read()[&address].get(&new_slot), Some(&U256::ZERO));
+        assert!(!db.storage().read()[&address].contains_key(&old_slot));
+        let block_hash = keccak256("synchronous cache update block");
+        backend.insert_or_update_block_hashes(BlockHashData::from_iter([(
+            U256::from(42),
+            block_hash,
+        )]));
+        assert_eq!(db.block_hashes().read().get(&U256::from(42)), Some(&block_hash));
+        let reader = backend.with_blocking_mode(BlockingMode::Block);
+        assert_eq!(reader.basic_ref(address).unwrap(), Some(replacement));
+        assert_eq!(reader.storage_ref(address, new_slot).unwrap(), U256::ZERO);
+        drop(handler);
+    }
+
+    #[test]
+    fn concurrent_cached_read_clones_share_values_and_counters() {
+        let provider = get_http_provider("http://127.0.0.1:0");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), None);
+        let (address, account) = shared_code_account("concurrent cached read account", 11, 7);
+        let slot = U256::from(3);
+        let value = U256::from(4);
+        db.accounts().write().insert(address, account.clone());
+        db.storage().write().insert(address, StorageInfo::from_iter([(slot, value)]));
+        let (backend, handler) = SharedBackend::new(provider, db, None);
+        drop(handler);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let reader = backend.with_blocking_mode(BlockingMode::Block);
+                let expected = account.clone();
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        assert_eq!(reader.basic_ref(address).unwrap(), Some(expected.clone()));
+                        assert_eq!(reader.storage_ref(address, slot).unwrap(), value);
+                    }
+                });
+            }
+        });
+        assert_eq!(backend.cache_hits(), 4 * 64 * 2);
+        assert_eq!(backend.cache_misses(), 0);
+    }
 }
