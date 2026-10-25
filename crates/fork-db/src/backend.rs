@@ -24,6 +24,7 @@ use futures::{
     task::{Context, Poll},
 };
 use imbl::HashMap as PersistentMap;
+use parking_lot::Mutex;
 use revm::{
     context::BlockEnv,
     database::DatabaseRef,
@@ -187,12 +188,6 @@ enum BackendRequest<N: Network = AnyNetwork> {
     /// Sets the pinned block to fetch data from
     SetPinnedBlock(BlockId),
 
-    /// Update Address data
-    UpdateAddress(AddressData),
-    /// Update Storage data
-    UpdateStorage(StorageData),
-    /// Update Block Hashes
-    UpdateBlockHash(BlockHashData),
     /// Any other request
     AnyRequest(Box<dyn WrappedAnyRequest>),
 }
@@ -207,7 +202,7 @@ pub struct BackendHandler<N: Network = AnyNetwork, B = BlockEnv> {
     /// Stores all the data.
     db: BlockchainDb<B>,
     /// Immutable code shared by cached and newly fetched accounts.
-    bytecodes: BytecodeInterner,
+    bytecodes: Arc<Mutex<BytecodeInterner>>,
     /// Requests currently in progress
     pending_requests: Vec<ProviderRequest<eyre::Report, N>>,
     /// Listeners that wait for a `get_account` related response
@@ -262,7 +257,7 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
         Self {
             provider,
             db,
-            bytecodes,
+            bytecodes: Arc::new(Mutex::new(bytecodes)),
             account_fetch_policy,
             pending_requests: Default::default(),
             account_requests: Default::default(),
@@ -336,22 +331,6 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
                 self.block_id = Some(block_id);
                 self.block_anchor = None;
                 self.block_generation = self.block_generation.wrapping_add(1);
-            }
-            BackendRequest::UpdateAddress(address_data) => {
-                for (address, mut data) in address_data {
-                    self.bytecodes.share_account_code(&mut data);
-                    self.db.accounts().write().insert(address, data);
-                }
-            }
-            BackendRequest::UpdateStorage(storage_data) => {
-                for (address, data) in storage_data {
-                    self.db.storage().write().insert(address, data);
-                }
-            }
-            BackendRequest::UpdateBlockHash(block_hash_data) => {
-                for (block, hash) in block_hash_data {
-                    self.db.block_hashes().write().insert(block, hash);
-                }
             }
             BackendRequest::AnyRequest(fut) => {
                 self.pending_requests.push(ProviderRequest::AnyRequest(fut));
@@ -778,7 +757,7 @@ impl<N: Network, B: ForkBlockEnv> Future for BackendHandler<N, B> {
                             };
 
                             // convert it to revm-style types
-                            let code = pin.bytecodes.intern(Bytecode::new_raw(code));
+                            let code = pin.bytecodes.lock().intern(Bytecode::new_raw(code));
                             let code_hash = code.hash_slow();
 
                             // update the cache
@@ -980,10 +959,10 @@ impl BlockingMode {
 /// there can be multiple `SharedBackend`s communicating with the same `BackendHandler`, hence this
 /// `Backend` type is thread safe.
 ///
-/// All `Backend` trait functions are delegated as a `BackendRequest` via the channel to the
-/// `BackendHandler`. All `BackendRequest` variants include a sender half of an additional channel
-/// that is used by the `BackendHandler` to send the result of an executed `BackendRequest` back to
-/// `SharedBackend`.
+/// Account and storage cache hits read the shared database directly. Cache updates commit to
+/// that same database synchronously, so subsequent reads observe them without polling the handler.
+/// Missing values and block-context requests use `BackendRequest` messages. Fetch requests carry
+/// a reply channel for the `BackendHandler` to return its result to `SharedBackend`.
 ///
 /// The `BackendHandler` holds a `Provider` to look up missing accounts or storage slots
 /// from remote (e.g. infura). It detects duplicate requests from multiple `SharedBackend`s and
@@ -1009,6 +988,8 @@ pub struct SharedBackend<N: Network = AnyNetwork, B: Serialize + Clone = BlockEn
     /// There is only one instance of the type, so as soon as the last `SharedBackend` is deleted,
     /// `FlushJsonBlockCacheDB<B>` is also deleted and the cache is flushed.
     cache: Arc<FlushJsonBlockCacheDB<B>>,
+    /// Immutable code shared by cache updates and remote fetches.
+    bytecodes: Arc<Mutex<BytecodeInterner>>,
 
     /// The mode for the `SharedBackend` to block in place or not
     blocking_mode: BlockingMode,
@@ -1070,7 +1051,11 @@ impl<N: Network, B: ForkBlockEnv> SharedBackend<N, B> {
         let (backend, backend_rx) = unbounded();
         let cache = Arc::new(FlushJsonBlockCacheDB(Arc::clone(db.cache())));
         let handler = BackendHandler::new(provider.erased(), db, backend_rx, pin_block, None);
-        (Self { backend, cache, blocking_mode: Default::default(), exact: false }, handler)
+        let bytecodes = Arc::clone(&handler.bytecodes);
+        (
+            Self { backend, cache, bytecodes, blocking_mode: Default::default(), exact: false },
+            handler,
+        )
     }
 
     /// Returns a new [`SharedBackend`] and [`BackendHandler`] pinned to an exact block.
@@ -1115,7 +1100,11 @@ impl<N: Network, B: ForkBlockEnv> SharedBackend<N, B> {
         db.block_hashes().write().insert(U256::from(anchor.number), anchor.hash);
         let handler =
             BackendHandler::new(provider.erased(), db, backend_rx, Some(block_id), Some(anchor));
-        Ok((Self { backend, cache, blocking_mode: Default::default(), exact: true }, handler))
+        let bytecodes = Arc::clone(&handler.bytecodes);
+        Ok((
+            Self { backend, cache, bytecodes, blocking_mode: Default::default(), exact: true },
+            handler,
+        ))
     }
 
     /// Returns a new `SharedBackend` and the `BackendHandler` with a specific blocking mode
@@ -1123,6 +1112,7 @@ impl<N: Network, B: ForkBlockEnv> SharedBackend<N, B> {
         Self {
             backend: self.backend.clone(),
             cache: self.cache.clone(),
+            bytecodes: self.bytecodes.clone(),
             blocking_mode: mode,
             exact: self.exact,
         }
@@ -1156,6 +1146,11 @@ impl<N: Network, B: ForkBlockEnv> SharedBackend<N, B> {
     }
 
     fn do_get_basic(&self, address: Address) -> DatabaseResult<Option<AccountInfo>> {
+        let cached = self.cache.0.db().accounts.read().get(&address).cloned();
+        if let Some(account) = cached {
+            self.cache.0.record_cache_hit();
+            return Ok(Some(account));
+        }
         self.blocking_mode.run(|| {
             let (sender, rx) = oneshot_channel();
             let req = BackendRequest::Basic(address, sender);
@@ -1165,6 +1160,18 @@ impl<N: Network, B: ForkBlockEnv> SharedBackend<N, B> {
     }
 
     fn do_get_storage(&self, address: Address, index: U256) -> DatabaseResult<U256> {
+        let cached = self
+            .cache
+            .0
+            .db()
+            .storage
+            .read()
+            .get(&address)
+            .and_then(|slots| slots.get(&index).copied());
+        if let Some(value) = cached {
+            self.cache.0.record_cache_hit();
+            return Ok(value);
+        }
         self.blocking_mode.run(|| {
             let (sender, rx) = oneshot_channel();
             let req = BackendRequest::Storage(address, index, sender);
@@ -1182,40 +1189,24 @@ impl<N: Network, B: ForkBlockEnv> SharedBackend<N, B> {
         })
     }
 
-    /// Inserts or updates data for multiple addresses
+    /// Synchronously inserts or updates data for multiple addresses.
     pub fn insert_or_update_address(&self, address_data: AddressData) {
-        let req = BackendRequest::UpdateAddress(address_data);
-        let err = self.backend.unbounded_send(req);
-        match err {
-            Ok(_) => (),
-            Err(e) => {
-                error!(target: "sharedbackend", "Failed to send update address request: {:?}", e)
-            }
+        let mut bytecodes = self.bytecodes.lock();
+        let mut accounts = self.cache.0.db().accounts.write();
+        for (address, mut data) in address_data {
+            bytecodes.share_account_code(&mut data);
+            accounts.insert(address, data);
         }
     }
 
-    /// Inserts or updates data for multiple storage slots
+    /// Synchronously replaces the supplied accounts' cached storage slots.
     pub fn insert_or_update_storage(&self, storage_data: StorageData) {
-        let req = BackendRequest::UpdateStorage(storage_data);
-        let err = self.backend.unbounded_send(req);
-        match err {
-            Ok(_) => (),
-            Err(e) => {
-                error!(target: "sharedbackend", "Failed to send update address request: {:?}", e)
-            }
-        }
+        self.cache.0.db().storage.write().extend(storage_data);
     }
 
-    /// Inserts or updates data for multiple block hashes
+    /// Synchronously inserts or updates cached block hashes.
     pub fn insert_or_update_block_hashes(&self, block_hash_data: BlockHashData) {
-        let req = BackendRequest::UpdateBlockHash(block_hash_data);
-        let err = self.backend.unbounded_send(req);
-        match err {
-            Ok(_) => (),
-            Err(e) => {
-                error!(target: "sharedbackend", "Failed to send update address request: {:?}", e)
-            }
-        }
+        self.cache.0.db().block_hashes.write().extend(block_hash_data);
     }
 
     /// Returns any arbitrary request on the provider
