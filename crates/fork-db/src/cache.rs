@@ -1373,4 +1373,207 @@ mod tests {
             }
         }
     }
+
+    fn shared_code_fixture() -> JsonBlockCacheData<BlockEnv> {
+        let cache = JsonBlockCacheData {
+            meta: Arc::new(RwLock::new(
+                BlockchainDbMeta::<BlockEnv>::default().with_fork_identity(
+                    keccak256("shared-code-block"),
+                    keccak256("shared-code-source"),
+                ),
+            )),
+            data: Arc::new(MemDb::default()),
+        };
+        let delegated =
+            Bytecode::new_eip7702(Address::from_word(keccak256("delegated-code-target")));
+        let legacy = Bytecode::new_legacy(delegated.original_bytes());
+        for (index, code) in
+            [Some(legacy.clone()), Some(legacy), Some(delegated), None, Some(Bytecode::default())]
+                .into_iter()
+                .enumerate()
+        {
+            let address = Address::from_word(keccak256(format!("shared-code-fixture-{index}")));
+            cache.data.accounts.write().insert(
+                address,
+                AccountInfo {
+                    balance: U256::MAX - U256::from(index),
+                    nonce: u64::MAX - index as u64,
+                    // Preserve the declared hash independently from actual code identity.
+                    code_hash: keccak256(format!("declared-code-hash-{index}")),
+                    code,
+                    ..Default::default()
+                },
+            );
+            cache
+                .data
+                .storage
+                .write()
+                .insert(address, PersistentMap::from(vec![(U256::MAX, U256::from(index))]));
+        }
+        cache.data.block_hashes.write().insert(U256::MAX, keccak256("shared-code-block-hash"));
+        cache
+    }
+
+    fn assert_shared_code_state(
+        expected: &JsonBlockCacheData<BlockEnv>,
+        actual: &JsonBlockCacheData<BlockEnv>,
+    ) {
+        assert_eq!(*expected.meta.read(), *actual.meta.read());
+        assert_eq!(*expected.data.storage.read(), *actual.data.storage.read());
+        assert_eq!(*expected.data.block_hashes.read(), *actual.data.block_hashes.read());
+        let expected = expected.data.accounts.read();
+        let actual = actual.data.accounts.read();
+        assert_eq!(expected.len(), actual.len());
+        for (address, account) in expected.iter() {
+            let recovered = &actual[address];
+            assert_eq!(
+                (account.balance, account.nonce, account.code_hash),
+                (recovered.balance, recovered.nonce, recovered.code_hash)
+            );
+            // AccountInfo equality ignores code, and Bytecode equality ignores kind.
+            assert_eq!(
+                serde_json::to_value(&account.code).unwrap(),
+                serde_json::to_value(&recovered.code).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_code_cache_stores_one_body_per_kind_and_preserves_full_state() {
+        let cache = shared_code_fixture();
+        let encoded = serde_json::to_value(&cache).unwrap();
+        assert_eq!(encoded["cache_format_version"], 2);
+        assert_eq!(encoded["codes"].as_array().unwrap().len(), 3);
+        let first = Address::from_word(keccak256("shared-code-fixture-0")).to_string();
+        let second = Address::from_word(keccak256("shared-code-fixture-1")).to_string();
+        assert_eq!(
+            encoded["accounts"][&first]["code_ref"],
+            encoded["accounts"][&second]["code_ref"]
+        );
+        for account in encoded["accounts"].as_object().unwrap().values() {
+            assert!(account.get("code").is_none());
+        }
+        let recovered: JsonBlockCacheData<BlockEnv> = serde_json::from_value(encoded).unwrap();
+        assert_shared_code_state(&cache, &recovered);
+        let accounts = recovered.data.accounts.read();
+        let first = accounts[&Address::from_word(keccak256("shared-code-fixture-0"))]
+            .code
+            .as_ref()
+            .unwrap();
+        let second = accounts[&Address::from_word(keccak256("shared-code-fixture-1"))]
+            .code
+            .as_ref()
+            .unwrap();
+        assert!(std::ptr::eq(
+            first.original_byte_slice().as_ptr(),
+            second.original_byte_slice().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn shared_code_cache_rejects_invalid_versions_and_references() {
+        let valid = serde_json::to_value(shared_code_fixture()).unwrap();
+        let first = Address::from_word(keccak256("shared-code-fixture-0")).to_string();
+        let mut cases = Vec::new();
+        let mut value = valid.clone();
+        value["cache_format_version"] = 999.into();
+        cases.push(value);
+        let mut value = valid.clone();
+        value.as_object_mut().unwrap().remove("cache_format_version");
+        cases.push(value);
+        let mut value = valid.clone();
+        value.as_object_mut().unwrap().remove("codes");
+        cases.push(value);
+        let mut value = valid.clone();
+        value["accounts"][&first]["code_ref"] = u64::MAX.into();
+        cases.push(value);
+        let mut value = valid.clone();
+        value["accounts"][&first]["code_ref"] = (-1).into();
+        cases.push(value);
+        let mut value = valid.clone();
+        value["accounts"][&first]["code"] = serde_json::to_value(Bytecode::default()).unwrap();
+        cases.push(value);
+        let mut value = valid.clone();
+        value["codes"] = serde_json::json!([]);
+        cases.push(value);
+        for (index, value) in cases.into_iter().enumerate() {
+            assert!(
+                serde_json::from_value::<JsonBlockCacheData<BlockEnv>>(value).is_err(),
+                "invalid case {index} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_code_cache_rejects_superseded_inline_layout() {
+        let cache = shared_code_fixture();
+        let value = serde_json::json!({"meta": &*cache.meta.read(), "accounts": &*cache.data.accounts.read(), "storage": &*cache.data.storage.read(), "block_hashes": &*cache.data.block_hashes.read(), "block_hash_cache_version": 1});
+        assert!(serde_json::from_value::<JsonBlockCacheData<BlockEnv>>(value).is_err());
+    }
+
+    #[test]
+    fn shared_code_cache_accepts_reordered_fields_and_rejects_truncated_data() {
+        let cache = shared_code_fixture();
+        let value = serde_json::to_value(&cache).unwrap();
+        let mut reordered = serde_json::Map::new();
+        for name in ["accounts", "block_hashes", "storage", "meta", "codes", "cache_format_version"]
+        {
+            reordered.insert(name.to_owned(), value[name].clone());
+        }
+        let bytes = serde_json::to_vec(&reordered).unwrap();
+        let recovered: JsonBlockCacheData<BlockEnv> = serde_json::from_slice(&bytes).unwrap();
+        assert_shared_code_state(&cache, &recovered);
+        for length in [bytes.len() / 2, bytes.len() - 1] {
+            assert!(
+                serde_json::from_slice::<JsonBlockCacheData<BlockEnv>>(&bytes[..length]).is_err()
+            );
+        }
+    }
+
+    struct UpdatingCacheWriter<'a> {
+        cache: &'a JsonBlockCacheData<BlockEnv>,
+        output: Vec<u8>,
+        updated: bool,
+    }
+
+    impl Write for UpdatingCacheWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.updated {
+                let code = Bytecode::new_raw(Bytes::from(vec![0x60, 0x42]));
+                self.cache.data.accounts.write().insert(
+                    Address::from_word(keccak256("concurrent-cache-addition")),
+                    AccountInfo {
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        ..Default::default()
+                    },
+                );
+                self.updated = true;
+            }
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shared_code_cache_uses_one_account_snapshot_for_codes_and_references() {
+        let cache = shared_code_fixture();
+        let mut writer = UpdatingCacheWriter { cache: &cache, output: Vec::new(), updated: false };
+        serde_json::to_writer(&mut writer, &cache).unwrap();
+        assert!(writer.updated);
+        assert_eq!(cache.data.accounts.read().len(), 6);
+        let recovered: JsonBlockCacheData<BlockEnv> =
+            serde_json::from_slice(&writer.output).unwrap();
+        assert_eq!(recovered.data.accounts.read().len(), 5);
+        assert!(
+            !recovered
+                .data
+                .accounts
+                .read()
+                .contains_key(&Address::from_word(keccak256("concurrent-cache-addition")))
+        );
+    }
 }
