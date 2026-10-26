@@ -21,7 +21,7 @@ use serde::{
 use std::{
     collections::BTreeSet,
     fmt, fs,
-    io::{BufReader, Cursor, Read, Write},
+    io::{BufReader, BufWriter, Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -29,9 +29,6 @@ use std::{
     },
 };
 use url::Url;
-
-#[cfg(not(feature = "zstd"))]
-use std::io::BufWriter;
 
 #[cfg(feature = "zstd")]
 use zstd::{Encoder, stream::read::Decoder};
@@ -620,9 +617,7 @@ impl<B: Serialize + Clone> JsonBlockCacheDB<B> {
 
         #[cfg(not(feature = "zstd"))]
         {
-            let mut writer = BufWriter::new(file.as_file_mut());
-            write_cache_json(&mut writer, &self.data)?;
-            writer.flush()?;
+            write_cache_json(file.as_file_mut(), &self.data)?;
         }
 
         file.as_file().sync_all()?;
@@ -632,7 +627,10 @@ impl<B: Serialize + Clone> JsonBlockCacheDB<B> {
 }
 
 fn write_cache_json(writer: impl Write, data: &impl Serialize) -> eyre::Result<()> {
-    serde_json::to_writer(writer, data)?;
+    // Hex formatting emits tiny fragments; batch them before compression or file I/O.
+    let mut writer = BufWriter::new(writer);
+    serde_json::to_writer(&mut writer, data)?;
+    writer.flush()?;
     Ok(())
 }
 
