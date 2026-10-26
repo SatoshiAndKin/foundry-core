@@ -1302,4 +1302,73 @@ mod tests {
         let error = write_cache_json(&mut writer, &data).unwrap_err();
         assert_eq!(error.to_string(), "injected cache flush failure");
     }
+
+    #[test]
+    fn large_cache_flush_finishes_frame_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-cache.json");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), Some(path.clone()));
+        let code = Bytecode::new_raw(Bytes::from(vec![0x5b; 24 * 1024]));
+        for index in 0..192u64 {
+            db.accounts().write().insert(
+                Address::from_word(keccak256(format!("large-cache-account-{index}"))),
+                AccountInfo {
+                    balance: U256::MAX - U256::from(index),
+                    nonce: index,
+                    code_hash: code.hash_slow(),
+                    code: Some(code.clone()),
+                    ..Default::default()
+                },
+            );
+        }
+        let expected = serde_json::to_value(&db.cache().data).unwrap();
+        db.cache().write_cache_atomically(&path).unwrap();
+        let loaded = JsonBlockCacheDB::<BlockEnv>::load(&path).unwrap();
+        assert_eq!(serde_json::to_value(&loaded.data).unwrap(), expected);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[derive(Clone)]
+    struct InterruptedLargeSerialization;
+
+    impl Serialize for InterruptedLargeSerialization {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry("written_before_failure", &"x".repeat(8 * 1024 * 1024))?;
+            Err(serde::ser::Error::custom("injected large serialization failure"))
+        }
+    }
+
+    #[test]
+    fn failed_large_flush_preserves_published_cache() {
+        for existing_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cache.json");
+            let previous = existing_cache.then(|| {
+                let db = JsonBlockCacheDB::new(
+                    Arc::new(RwLock::new(BlockchainDbMeta::new(
+                        BlockEnv::default(),
+                        String::new(),
+                    ))),
+                    Some(path.clone()),
+                );
+                db.write_cache_atomically(&path).unwrap();
+                fs::read(&path).unwrap()
+            });
+            let failing = JsonBlockCacheDB::new(
+                Arc::new(RwLock::new(BlockchainDbMeta::new(
+                    InterruptedLargeSerialization,
+                    String::new(),
+                ))),
+                Some(path.clone()),
+            );
+            let error = failing.write_cache_atomically(&path).unwrap_err();
+            assert_eq!(error.to_string(), "injected large serialization failure");
+            assert_eq!(fs::read(&path).ok(), previous);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), usize::from(existing_cache));
+            if existing_cache {
+                JsonBlockCacheDB::<BlockEnv>::load(path).unwrap();
+            }
+        }
+    }
 }
