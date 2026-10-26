@@ -611,6 +611,8 @@ impl<B: Serialize + Clone> JsonBlockCacheDB<B> {
         {
             // Finish the frame before publishing, so interrupted writes keep the old cache.
             let mut encoder = Encoder::new(file.as_file_mut(), 3)?;
+            // Overlap bounded compression work with JSON serialization.
+            encoder.multithread(2)?;
             write_cache_json(&mut encoder, &self.data)?;
             encoder.finish()?;
         }
