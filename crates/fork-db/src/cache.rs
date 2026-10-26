@@ -14,13 +14,11 @@ use revm::{
     state::{Account, AccountInfo, AccountStatus, Bytecode},
 };
 use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{DeserializeOwned, MapAccess, Visitor},
-    ser::SerializeMap,
+    Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned, ser::SerializeMap,
 };
 use std::{
     collections::BTreeSet,
-    fmt, fs,
+    fs,
     io::{BufReader, BufWriter, Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -639,25 +637,81 @@ fn write_cache_json(writer: impl Write, data: &impl Serialize) -> eyre::Result<(
 /// The Data the [JsonBlockCacheDB] can read and flush
 ///
 /// This will be deserialized in a JSON object with the keys:
-/// `["meta", "accounts", "storage", "block_hashes", "block_hash_cache_version"]`
+/// `["cache_format_version", "meta", "codes", "accounts", "storage", "block_hashes"]`
 #[derive(Debug)]
 pub struct JsonBlockCacheData<B> {
     pub meta: Arc<RwLock<BlockchainDbMeta<B>>>,
     pub data: Arc<MemDb>,
 }
 
-const BLOCK_HASH_CACHE_VERSION: u8 = 1;
+/// Version 2 stores code once and preserves exact block hashes and account state.
+const CACHE_FORMAT_VERSION: u32 = 2;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedAccount {
+    balance: U256,
+    nonce: u64,
+    code_hash: B256,
+    code_ref: Option<usize>,
+}
+
+struct AccountsWithCodeRefs(Vec<(Address, CachedAccount)>);
+
+impl Serialize for AccountsWithCodeRefs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (address, account) in &self.0 {
+            map.serialize_entry(address, account)?;
+        }
+        map.end()
+    }
+}
 
 impl<B: Serialize + Clone> Serialize for JsonBlockCacheData<B> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(5))?;
-
-        map.serialize_entry("meta", &self.meta.read().clone())?;
-        map.serialize_entry("accounts", &self.data.accounts.read().clone())?;
-        map.serialize_entry("storage", &self.data.storage.read().clone())?;
-        map.serialize_entry("block_hashes", &self.data.block_hashes.read().clone())?;
-        map.serialize_entry("block_hash_cache_version", &BLOCK_HASH_CACHE_VERSION)?;
-
+        // Both tables must describe one account snapshot, including during concurrent inserts.
+        let accounts = self.data.accounts.read().clone();
+        let meta = self.meta.read().clone();
+        let storage = self.data.storage.read().clone();
+        let block_hashes = self.data.block_hashes.read().clone();
+        let mut ordered_accounts = accounts.iter().collect::<Vec<_>>();
+        ordered_accounts.sort_unstable_by_key(|(address, _)| **address);
+        let mut codes = Vec::<&Bytecode>::new();
+        let mut code_indices = HashMap::<_, usize>::default();
+        let mut records = Vec::with_capacity(ordered_accounts.len());
+        for (address, account) in ordered_accounts {
+            let code_ref = if let Some(code) = &account.code {
+                let key = (code.kind(), code.hash_slow());
+                let index = *code_indices.entry(key).or_insert_with(|| {
+                    let index = codes.len();
+                    codes.push(code);
+                    index
+                });
+                if codes[index].original_byte_slice() != code.original_byte_slice() {
+                    return Err(serde::ser::Error::custom("conflicting code table identity"));
+                }
+                Some(index)
+            } else {
+                None
+            };
+            records.push((
+                *address,
+                CachedAccount {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash,
+                    code_ref,
+                },
+            ));
+        }
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("cache_format_version", &CACHE_FORMAT_VERSION)?;
+        map.serialize_entry("meta", &meta)?;
+        map.serialize_entry("codes", &codes)?;
+        map.serialize_entry("accounts", &AccountsWithCodeRefs(records))?;
+        map.serialize_entry("storage", &storage)?;
+        map.serialize_entry("block_hashes", &block_hashes)?;
         map.end()
     }
 }
@@ -665,63 +719,52 @@ impl<B: Serialize + Clone> Serialize for JsonBlockCacheData<B> {
 impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBlockCacheData<B> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Data<B> {
+            cache_format_version: u32,
             meta: B,
-            #[serde(deserialize_with = "deserialize_accounts")]
-            accounts: PersistentMap<Address, AccountInfo>,
+            codes: Vec<Bytecode>,
+            accounts: PersistentMap<Address, CachedAccount>,
             storage: PersistentMap<Address, StorageInfo>,
             block_hashes: PersistentMap<U256, B256>,
-            #[serde(default)]
-            block_hash_cache_version: u8,
         }
-
-        let Data { meta, accounts, storage, mut block_hashes, block_hash_cache_version } =
+        let Data { cache_format_version, meta, codes, accounts, storage, block_hashes } =
             Data::<BlockchainDbMeta<B>>::deserialize(deserializer)?;
-        if block_hash_cache_version != BLOCK_HASH_CACHE_VERSION {
-            block_hashes.clear();
+        if cache_format_version != CACHE_FORMAT_VERSION {
+            return Err(serde::de::Error::custom("unsupported fork cache format version"));
         }
-
+        let mut recovered = PersistentMap::new();
+        for (address, account) in accounts {
+            let code = account
+                .code_ref
+                .map(|index| {
+                    codes.get(index).cloned().ok_or_else(|| {
+                        <D::Error as serde::de::Error>::custom(format!(
+                            "invalid fork cache code reference {index}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            recovered.insert(
+                address,
+                AccountInfo {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash,
+                    code,
+                    ..Default::default()
+                },
+            );
+        }
         Ok(Self {
             meta: Arc::new(RwLock::new(meta)),
             data: Arc::new(MemDb {
-                accounts: RwLock::new(accounts),
+                accounts: RwLock::new(recovered),
                 storage: RwLock::new(storage),
                 block_hashes: RwLock::new(block_hashes),
             }),
         })
     }
-}
-
-fn deserialize_accounts<'de, D>(
-    deserializer: D,
-) -> Result<PersistentMap<Address, AccountInfo>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct AccountsVisitor;
-
-    impl<'de> Visitor<'de> for AccountsVisitor {
-        type Value = PersistentMap<Address, AccountInfo>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a map of fork accounts")
-        }
-
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: MapAccess<'de>,
-        {
-            let mut accounts = PersistentMap::new();
-            let mut bytecodes = BytecodeInterner::default();
-            while let Some((address, mut account)) = map.next_entry::<Address, AccountInfo>()? {
-                bytecodes.share_account_code(&mut account);
-                accounts.insert(address, account);
-            }
-            Ok(accounts)
-        }
-    }
-
-    deserializer.deserialize_map(AccountsVisitor)
 }
 
 /// A type that flushes a `JsonBlockCacheDB` on drop
@@ -790,6 +833,26 @@ mod tests {
     #[test]
     fn can_deserialize_cache() {
         let s = r#"{
+    "cache_format_version": 2,
+    "codes": [
+        {
+            "LegacyAnalyzed": {
+                "bytecode": "0x00",
+                "original_len": 0,
+                "jump_table": {
+                    "order": "bitvec::order::Lsb0",
+                    "head": {
+                        "width": 8,
+                        "index": 0
+                    },
+                    "bits": 1,
+                    "data": [
+                        0
+                    ]
+                }
+            }
+        }
+    ],
     "meta": {
         "cfg_env": {
             "chain_id": 1337,
@@ -818,21 +881,7 @@ mod tests {
             "balance": "0x0",
             "nonce": 10,
             "code_hash": "0x3ac64c95eedf82e5d821696a12daac0e1b22c8ee18a9fd688b00cfaf14550aad",
-            "code": {
-                "LegacyAnalyzed": {
-                    "bytecode": "0x00",
-                    "original_len": 0,
-                    "jump_table": {
-                      "order": "bitvec::order::Lsb0",
-                      "head": {
-                        "width": 8,
-                        "index": 0
-                      },
-                      "bits": 1,
-                      "data": [0]
-                    }
-                }
-            }
+            "code_ref": 0
         }
     },
     "storage": {
@@ -847,13 +896,7 @@ mod tests {
             "0x2": "0x6"
         }
     },
-    "block_hashes": {
-        "0xed3deb": "0xbf7be3174b261ea3c377b6aba4a1e05d5fae7eee7aab5691087c20cf353e9877",
-        "0xed3de9": "0xba1c3648e0aee193e7d00dffe4e9a5e420016b4880455641085a4731c1d32eef",
-        "0xed3de8": "0x61d1491c03a9295fb13395cca18b17b4fa5c64c6b8e56ee9cc0a70c3f6cf9855",
-        "0xed3de7": "0xb54560b5baeccd18350d56a3bee4035432294dc9d2b7e02f157813e1dee3a0be",
-        "0xed3dea": "0x816f124480b9661e1631c6ec9ee39350bda79f0cbfc911f925838d88e3d02e4b"
-    }
+    "block_hashes": {}
 }"#;
 
         let cache: JsonBlockCacheData<BlockEnv> = serde_json::from_str(s).unwrap();
@@ -867,6 +910,26 @@ mod tests {
     #[test]
     fn can_deserialize_cache_post_4844() {
         let s = r#"{
+    "cache_format_version": 2,
+    "codes": [
+        {
+            "LegacyAnalyzed": {
+                "bytecode": "0x00",
+                "original_len": 0,
+                "jump_table": {
+                    "order": "bitvec::order::Lsb0",
+                    "head": {
+                        "width": 8,
+                        "index": 0
+                    },
+                    "bits": 1,
+                    "data": [
+                        0
+                    ]
+                }
+            }
+        }
+    ],
     "meta": {
         "cfg_env": {
             "chain_id": 1,
@@ -901,21 +964,7 @@ mod tests {
             "balance": "0x8e0c373cfcdfd0eb",
             "nonce": 128912,
             "code_hash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
-            "code": {
-                "LegacyAnalyzed": {
-                    "bytecode": "0x00",
-                    "original_len": 0,
-                    "jump_table": {
-                      "order": "bitvec::order::Lsb0",
-                      "head": {
-                        "width": 8,
-                        "index": 0
-                      },
-                      "bits": 1,
-                      "data": [0]
-                    }
-                }
-            }
+            "code_ref": 0
         }
     },
     "storage": {},
@@ -1493,7 +1542,7 @@ mod tests {
         let mut value = valid.clone();
         value["accounts"][&first]["code"] = serde_json::to_value(Bytecode::default()).unwrap();
         cases.push(value);
-        let mut value = valid.clone();
+        let mut value = valid;
         value["codes"] = serde_json::json!([]);
         cases.push(value);
         for (index, value) in cases.into_iter().enumerate() {
