@@ -2063,6 +2063,41 @@ fn can_compile_dapp_detect_swapped_remapping_bindings() {
 }
 
 #[test]
+fn can_remove_build_infos_of_invalidated_cache() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.project_mut().build_info = true;
+    project.add_source("A", "pragma solidity ^0.8.10; contract A {}").unwrap();
+
+    let build_infos = |project: &TempProject<MultiCompiler>| {
+        fs::read_dir(project.project().build_info_path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path().file_stem().unwrap().to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>()
+    };
+
+    project.compile().unwrap().assert_success();
+    let initial = build_infos(&project);
+    assert_eq!(initial.len(), 1);
+
+    // An unused remapping, such as one discovered in a newly installed library, invalidates the
+    // cache and changes the compiler input.
+    let lib = project.paths().libraries[0].join("dep");
+    project
+        .paths_mut()
+        .remappings
+        .push(Remapping::from_str(&format!("@dep/={}/", lib.display())).unwrap());
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
+
+    let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    let current = build_infos(&project);
+    assert_eq!(current, cache.builds);
+    assert_eq!(current.len(), 1);
+    assert!(current.is_disjoint(&initial));
+}
+
+#[test]
 fn can_compile_dapp_detect_changes_in_sources() {
     let project = TempProject::<MultiCompiler>::dapptools().unwrap();
 
@@ -7592,4 +7627,94 @@ contract Target {{
             "{name}"
         );
     }
+}
+
+#[test]
+fn can_flatten_spdx_string_literal() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+
+    project
+        .add_source(
+            "A",
+            r#"pragma solidity ^0.8.10;
+contract A {
+    event Message(string value);
+    function a() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+"#,
+        )
+        .unwrap();
+
+    let target = project
+        .add_source(
+            "B",
+            r#"pragma solidity ^0.8.10;
+import "./A.sol";
+contract B is A {
+    function b() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+"#,
+        )
+        .unwrap();
+
+    test_flatteners(&project, &target, |result| {
+        assert_eq!(
+            result,
+            r#"pragma solidity ^0.8.10;
+
+// src/A.sol
+
+contract A {
+    event Message(string value);
+    function a() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+
+// src/B.sol
+
+contract B is A {
+    function b() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+"#
+        );
+    });
+}
+
+#[test]
+fn can_flatten_spdx_comment_on_code_line() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+
+    project
+        .add_source(
+            "A",
+            r"pragma solidity ^0.8.10;
+contract A {} // SPDX-License-Identifier: MIT
+",
+        )
+        .unwrap();
+
+    // Comments inside top-level nodes are not file-level license identifiers.
+    project
+        .add_source(
+            "C",
+            r"pragma /* SPDX-License-Identifier: MIT */ solidity ^0.8.10;
+contract/* SPDX-License-Identifier: MIT */C {}
+",
+        )
+        .unwrap();
+
+    let target = project
+        .add_source(
+            "B",
+            r#"/* SPDX-License-Identifier: MIT */ pragma solidity ^0.8.10; import "./A.sol"; import "./C.sol"; contract B is A, C {}
+"#,
+        )
+        .unwrap();
+
+    let result = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    assert_eq!(
+        result,
+        "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.10;\n\n// src/A.sol\n\ncontract A {} \n\n// src/C.sol\n\ncontract/* SPDX-License-Identifier: MIT */C {}\n\n// src/B.sol\n    contract B is A, C {}\n"
+    );
+    let flattened = project.add_source("Flattened", result).unwrap();
+    project.project().compile_file(flattened).unwrap().assert_success();
 }
