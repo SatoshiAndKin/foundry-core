@@ -8,7 +8,7 @@ on:
   pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: "${{ github.event_name == 'pull_request' && format('pr-ci-ci.yml-pull_request-{0}', github.event.number || github.run_id) || format('{0}-{1}', github.workflow, github.head_ref || github.run_id) }}"
   cancel-in-progress: true
 
 env:
@@ -298,7 +298,7 @@ jobs:
 
   ci-success:
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     permissions: {}
     needs:
       - rustfmt
