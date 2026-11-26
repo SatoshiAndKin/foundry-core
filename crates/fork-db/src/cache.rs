@@ -6,6 +6,7 @@ use imbl::HashMap as PersistentMap;
 use parking_lot::RwLock;
 use revm::{
     DatabaseCommit,
+    bytecode::BytecodeKind,
     context::BlockEnv,
     primitives::{
         KECCAK_EMPTY,
@@ -352,12 +353,12 @@ impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for Blockc
 /// Share immutable code across accounts without sharing their balances or nonces.
 #[derive(Debug, Default)]
 pub(crate) struct BytecodeInterner {
-    codes: HashMap<B256, Bytecode>,
+    codes: HashMap<(BytecodeKind, B256), Bytecode>,
 }
 
 impl BytecodeInterner {
     pub(crate) fn intern(&mut self, code: Bytecode) -> Bytecode {
-        self.codes.entry(code.hash_slow()).or_insert(code).clone()
+        self.codes.entry((code.kind(), code.hash_slow())).or_insert(code).clone()
     }
 
     pub(crate) fn share_account_code(&mut self, account: &mut AccountInfo) {
@@ -646,9 +647,9 @@ pub struct JsonBlockCacheData<B> {
 
 /// Version 2 stores code once and preserves exact block hashes and account state.
 const CACHE_FORMAT_VERSION: u32 = 2;
+const LEGACY_BLOCK_HASH_CACHE_VERSION: u8 = 1;
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Serialize)]
 struct CachedAccount {
     balance: U256,
     nonce: u64,
@@ -718,33 +719,79 @@ impl<B: Serialize + Clone> Serialize for JsonBlockCacheData<B> {
 
 impl<'de, B: DeserializeOwned + Default + Serialize> Deserialize<'de> for JsonBlockCacheData<B> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A missing field is distinct from an explicitly null code or reference.
+        fn present<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<T>, D::Error> {
+            T::deserialize(deserializer).map(Some)
+        }
+
+        #[derive(Clone, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StoredAccount {
+            balance: U256,
+            nonce: u64,
+            code_hash: B256,
+            #[serde(default, deserialize_with = "present")]
+            code: Option<Option<Bytecode>>,
+            #[serde(default, deserialize_with = "present")]
+            code_ref: Option<Option<usize>>,
+        }
+
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Data<B> {
-            cache_format_version: u32,
+            #[serde(default, deserialize_with = "present")]
+            cache_format_version: Option<u32>,
             meta: B,
-            codes: Vec<Bytecode>,
-            accounts: PersistentMap<Address, CachedAccount>,
+            #[serde(default, deserialize_with = "present")]
+            codes: Option<Vec<Bytecode>>,
+            accounts: PersistentMap<Address, StoredAccount>,
             storage: PersistentMap<Address, StorageInfo>,
             block_hashes: PersistentMap<U256, B256>,
+            #[serde(default, deserialize_with = "present")]
+            block_hash_cache_version: Option<u8>,
         }
-        let Data { cache_format_version, meta, codes, accounts, storage, block_hashes } =
-            Data::<BlockchainDbMeta<B>>::deserialize(deserializer)?;
-        if cache_format_version != CACHE_FORMAT_VERSION {
-            return Err(serde::de::Error::custom("unsupported fork cache format version"));
-        }
+
+        let Data {
+            cache_format_version,
+            meta,
+            codes,
+            accounts,
+            storage,
+            mut block_hashes,
+            block_hash_cache_version,
+        } = Data::<BlockchainDbMeta<B>>::deserialize(deserializer)?;
+        let codes = match (cache_format_version, codes, block_hash_cache_version) {
+            (Some(CACHE_FORMAT_VERSION), Some(codes), None) => Some(codes),
+            (None, None, legacy_version) => {
+                if legacy_version != Some(LEGACY_BLOCK_HASH_CACHE_VERSION) {
+                    block_hashes.clear();
+                }
+                None
+            }
+            _ => return Err(serde::de::Error::custom("invalid or unsupported fork cache format")),
+        };
         let mut recovered = PersistentMap::new();
         for (address, account) in accounts {
-            let code = account
-                .code_ref
-                .map(|index| {
-                    codes.get(index).cloned().ok_or_else(|| {
-                        <D::Error as serde::de::Error>::custom(format!(
-                            "invalid fork cache code reference {index}"
-                        ))
+            let code = match (&codes, account.code, account.code_ref) {
+                (Some(codes), None, code_ref) => code_ref
+                    .flatten()
+                    .map(|index| {
+                        codes.get(index).cloned().ok_or_else(|| {
+                            <D::Error as serde::de::Error>::custom(format!(
+                                "invalid fork cache code reference {index}"
+                            ))
+                        })
                     })
-                })
-                .transpose()?;
+                    .transpose()?,
+                (None, code, None) => code.flatten(),
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "account does not match fork cache format",
+                    ));
+                }
+            };
             recovered.insert(
                 address,
                 AccountInfo {
@@ -1554,10 +1601,32 @@ mod tests {
     }
 
     #[test]
-    fn shared_code_cache_rejects_superseded_inline_layout() {
-        let cache = shared_code_fixture();
-        let value = serde_json::json!({"meta": &*cache.meta.read(), "accounts": &*cache.data.accounts.read(), "storage": &*cache.data.storage.read(), "block_hashes": &*cache.data.block_hashes.read(), "block_hash_cache_version": 1});
-        assert!(serde_json::from_value::<JsonBlockCacheData<BlockEnv>>(value).is_err());
+    fn legacy_cache_survives_offline_open_and_flush() {
+        let expected = shared_code_fixture();
+        let mut legacy = serde_json::json!({
+            "meta": &*expected.meta.read(),
+            "accounts": &*expected.data.accounts.read(),
+            "storage": &*expected.data.storage.read(),
+            "block_hashes": &*expected.data.block_hashes.read(),
+        });
+
+        // Older block hashes could use different semantics. Keep the rest of their state.
+        let stale = serde_json::from_value::<JsonBlockCacheData<BlockEnv>>(legacy.clone()).unwrap();
+        assert!(stale.data.block_hashes.read().is_empty());
+        *stale.data.block_hashes.write() = expected.data.block_hashes.read().clone();
+        assert_shared_code_state(&expected, &stale);
+
+        legacy["block_hash_cache_version"] = LEGACY_BLOCK_HASH_CACHE_VERSION.into();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork-cache.json");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let db = BlockchainDb::new_skip_check(expected.meta.read().clone(), Some(path.clone()));
+        let loaded = JsonBlockCacheData { meta: db.meta().clone(), data: db.db().clone() };
+        assert_shared_code_state(&expected, &loaded);
+
+        drop(FlushJsonBlockCacheDB(db.cache().clone()));
+        let rewritten = JsonBlockCacheDB::<BlockEnv>::load(path).unwrap();
+        assert_shared_code_state(&expected, &rewritten.data);
     }
 
     #[test]

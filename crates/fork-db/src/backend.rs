@@ -2687,6 +2687,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn backend_preserves_different_code_kinds_with_identical_bytes() {
+        let provider = get_http_provider("http://127.0.0.1:0");
+        let db = BlockchainDb::new(BlockchainDbMeta::<BlockEnv>::default(), None);
+        let legacy_address = Address::with_last_byte(1);
+        let delegated_address = Address::with_last_byte(2);
+        let delegated = Bytecode::new_eip7702(Address::with_last_byte(3));
+        let legacy = Bytecode::new_legacy(delegated.original_bytes());
+        assert_eq!(legacy.hash_slow(), delegated.hash_slow());
+        let legacy_kind = legacy.kind();
+        let delegated_kind = delegated.kind();
+        db.accounts().write().extend([
+            (legacy_address, AccountInfo { code: Some(legacy), ..Default::default() }),
+            (delegated_address, AccountInfo { code: Some(delegated), ..Default::default() }),
+        ]);
+
+        let (backend, _handler) = SharedBackend::new(provider, db, None);
+        let read_kind = |address| backend.basic_ref(address).unwrap().unwrap().code.unwrap().kind();
+        assert_eq!(read_kind(legacy_address), legacy_kind);
+        assert_eq!(read_kind(delegated_address), delegated_kind);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backend_shares_updated_bytecode() {
         let provider = get_http_provider("http://127.0.0.1:0");
